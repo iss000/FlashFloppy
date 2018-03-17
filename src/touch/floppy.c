@@ -180,12 +180,12 @@ static void IRQ_input_changed(void)
         drv->step.inward = !(inp & m(inp_dir));
         if (drv->cyl != (drv->step.inward ? 255 : 0)) {
             /* Valid step request for this drive: start the step operation. */
-            drv->step.start = stk_now();
+            drv->step.start = time_now();
             drv->step.state = STEP_started;
             drive_change_output(drv, outp_trk0, FALSE);
             if (dma_rd != NULL)
                 rdata_stop();
-            IRQx_set_pending(STEP_IRQ);
+            IRQx_set_pending(FLOPPY_SOFTIRQ);
         }
     }
 

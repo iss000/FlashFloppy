@@ -9,7 +9,7 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
-#define FW_VER "0.9.8a"
+#define FW_VER "0.9.16a"
 
 #ifndef NDEBUG
 #define ASSERT(p) do { if (!(p)) illegal(); } while (0)
@@ -155,6 +155,7 @@ void lcd_clear(void);
 void lcd_write(int col, int row, int min, const char *str);
 void lcd_backlight(bool_t on);
 void lcd_sync(void);
+extern uint8_t lcd_columns, lcd_rows;
 
 /* Gotek: USB stack processing */
 void usbh_msc_init(void);
@@ -214,7 +215,7 @@ void EXC_unused(void);
 #define TIMER_IRQ_PRI         4
 #define WDATA_IRQ_PRI         7
 #define RDATA_IRQ_PRI         8
-#define FLOPPY_IRQ_LO_PRI     9
+#define FLOPPY_SOFTIRQ_PRI    9
 #define I2C_IRQ_PRI          13
 #define USB_IRQ_PRI          14
 

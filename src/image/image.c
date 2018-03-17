@@ -15,7 +15,9 @@ extern const struct image_handler img_image_handler;
 extern const struct image_handler st_image_handler;
 extern const struct image_handler dsk_image_handler;
 extern const struct image_handler da_image_handler;
-extern const struct image_handler adl_image_handler;
+extern const struct image_handler adfs_image_handler;
+extern const struct image_handler trd_image_handler;
+extern const struct image_handler opd_image_handler;
 
 bool_t image_valid(FILINFO *fp)
 {
@@ -28,14 +30,16 @@ bool_t image_valid(FILINFO *fp)
     /* Check valid extension. */
     filename_extension(fp->fname, ext, sizeof(ext));
     if (!strcmp(ext, "adf")) {
-        return !(fp->fsize % (11*512));
+        return (ff_cfg.host == HOST_acorn) || !(fp->fsize % (11*512));
     } else if (!strcmp(ext, "dsk")
                || !strcmp(ext, "hfe")
                || !strcmp(ext, "img")
                || !strcmp(ext, "ima")
                || !strcmp(ext, "st")
                || !strcmp(ext, "adl")
-               || !strcmp(ext, "adm")) {
+               || !strcmp(ext, "adm")
+               || !strcmp(ext, "trd")
+               || !strcmp(ext, "opd")) {
         return TRUE;
     }
 
@@ -45,9 +49,17 @@ bool_t image_valid(FILINFO *fp)
 static bool_t try_handler(struct image *im, const struct slot *slot,
                           const struct image_handler *handler)
 {
+    struct image_bufs bufs = im->bufs;
     BYTE mode;
 
-    im->handler = im->_handler = handler;
+    /* Reinitialise image structure, except for static buffers. */
+    memset(im, 0, sizeof(*im));
+    im->bufs = bufs;
+    im->write_bc_ticks = sysclk_us(2);
+    im->stk_per_rev = stk_ms(200);
+    im->cur_track = ~0;
+
+    im->handler = handler;
 
     mode = FA_READ | FA_OPEN_EXISTING;
     if (handler->write_track != NULL)
@@ -69,29 +81,25 @@ void image_open(struct image *im, const struct slot *slot)
     };
 
     char ext[sizeof(slot->type)+1];
-    struct image_bufs bufs = im->bufs;
     const struct image_handler *hint;
     int i;
-
-    /* Reinitialise image structure, except for static buffers. */
-    memset(im, 0, sizeof(*im));
-    im->bufs = bufs;
-    im->write_bc_ticks = sysclk_us(2);
 
     /* Extract filename extension (if available). */
     memcpy(ext, slot->type, sizeof(slot->type));
     ext[sizeof(slot->type)] = '\0';
 
     /* Use the extension as a hint to the correct image handler. */
-    
-    hint = (!strcmp(ext, "adf") ? &adf_image_handler
+    hint = (!strcmp(ext, "adf") ? ((ff_cfg.host == HOST_acorn)
+                                   ? &adfs_image_handler : &adf_image_handler)
             : !strcmp(ext, "dsk") ? &dsk_image_handler
             : !strcmp(ext, "hfe") ? &hfe_image_handler
             : !strcmp(ext, "img") ? &img_image_handler
             : !strcmp(ext, "ima") ? &img_image_handler
             : !strcmp(ext, "st") ? &st_image_handler
-            : !strcmp(ext, "adl") ? &adl_image_handler
-            : !strcmp(ext, "adm") ? &adl_image_handler
+            : !strcmp(ext, "adl") ? &adfs_image_handler
+            : !strcmp(ext, "adm") ? &adfs_image_handler
+            : !strcmp(ext, "trd") ? &trd_image_handler
+            : !strcmp(ext, "opd") ? &opd_image_handler
             : NULL);
     if (hint) {
         if (try_handler(im, slot, hint))
@@ -112,25 +120,18 @@ void image_open(struct image *im, const struct slot *slot)
     F_die(FR_BAD_IMAGE);
 }
 
-bool_t image_seek_track(
-    struct image *im, uint16_t track, stk_time_t *start_pos)
+bool_t image_setup_track(
+    struct image *im, uint16_t track, uint32_t *start_pos)
 {
-    /* If we are exiting D-A mode then we need to re-read the config file. */
-    if ((im->handler == &da_image_handler) && (track < 510))
-        return TRUE;
+    if (track < 510) {
+        /* If we are exiting D-A mode then need to re-read the config file. */
+        if (im->handler == &da_image_handler)
+            return TRUE;
+    } else {
+        im->handler = &da_image_handler;
+    }
 
-    /* If we are already seeked to this track and we are not interested in 
-     * a particular rotational position (ie. we are writing) then we have 
-     * nothing to do. */
-    if ((start_pos == NULL) && (track == im->cur_track))
-        return FALSE;
-
-    /* Are we in special direct-access mode, or not? */
-    im->handler = (track >= 510)
-        ? &da_image_handler
-        : im->_handler;
-
-    im->handler->seek_track(im, track, start_pos);
+    im->handler->setup_track(im, track, start_pos);
 
     return FALSE;
 }
@@ -140,19 +141,20 @@ bool_t image_read_track(struct image *im)
     return im->handler->read_track(im);
 }
 
-uint16_t mfm_rdata_flux(struct image *im, uint16_t *tbuf, uint16_t nr,
-                        uint32_t ticks_per_cell)
+uint16_t bc_rdata_flux(struct image *im, uint16_t *tbuf, uint16_t nr)
 {
+    uint32_t ticks_per_cell = im->ticks_per_cell;
     uint32_t ticks = im->ticks_since_flux;
     uint32_t x, y = 32, todo = nr;
-    struct image_buf *mfm = &im->bufs.read_mfm;
-    uint32_t *mfmb = mfm->p, mfmc = mfm->cons, mfmp = mfm->prod & ~31;
+    struct image_buf *bc = &im->bufs.read_bc;
+    uint32_t *bc_b = bc->p, bc_c = bc->cons, bc_p = bc->prod & ~31;
+    unsigned int bc_mask = (bc->len / 4) - 1;
 
-    /* Convert pre-generated MFM into flux timings. */
-    while (mfmc != mfmp) {
-        y = mfmc % 32;
-        x = be32toh(mfmb[(mfmc/32)%(mfm->len/4)]) << y;
-        mfmc += 32 - y;
+    /* Convert pre-generated bitcells into flux timings. */
+    while (bc_c != bc_p) {
+        y = bc_c % 32;
+        x = be32toh(bc_b[(bc_c / 32) & bc_mask]) << y;
+        bc_c += 32 - y;
         im->cur_bc += 32 - y;
         im->cur_ticks += (32 - y) * ticks_per_cell;
         while (y < 32) {
@@ -171,7 +173,7 @@ uint16_t mfm_rdata_flux(struct image *im, uint16_t *tbuf, uint16_t nr,
     ASSERT(y == 32);
 
 out:
-    mfm->cons = mfmc - (32 - y);
+    bc->cons = bc_c - (32 - y);
     im->cur_bc -= 32 - y;
     im->cur_ticks -= (32 - y) * ticks_per_cell;
     im->ticks_since_flux = ticks;

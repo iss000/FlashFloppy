@@ -61,12 +61,15 @@ static volatile uint8_t refresh_count;
 /* I2C data buffer. Data is DMAed to the I2C peripheral. */
 static uint32_t buffer[256/4];
 
-/* 16x2 text buffer, rendered into I2C data and placed into buffer[]. */
-static char text[2][16];
+/* Text buffer, rendered into I2C data and placed into buffer[]. */
+static char text[2][21];
+
+/* Columns and rows of text. */
+uint8_t lcd_columns, lcd_rows;
 
 /* Occasionally the I2C/DMA engine seems to get stuck. Detect this with 
  * a timeout timer and unwedge it by calling the I2C error handler. */
-#define DMA_TIMEOUT stk_ms(200)
+#define DMA_TIMEOUT time_ms(200)
 static struct timer timeout_timer;
 static void timeout_fn(void *unused)
 {
@@ -125,7 +128,7 @@ static void dma_start(unsigned int sz)
                      DMA_CCR_EN);
 
     /* Set the timeout timer in case the DMA hangs for any reason. */
-    timer_set(&timeout_timer, stk_add(stk_now(), DMA_TIMEOUT));
+    timer_set(&timeout_timer, time_now() + DMA_TIMEOUT);
 }
 
 /* Emit a 4-bit command to the HD44780 via the DMA buffer. */
@@ -244,23 +247,32 @@ static uint8_t i2c_probe_range(uint8_t s, uint8_t e)
 
 void lcd_clear(void)
 {
-    lcd_write(0, 0, 16, "");
-    lcd_write(0, 1, 16, "");
+    lcd_write(0, 0, -1, "");
+    lcd_write(0, 1, -1, "");
 }
 
 void lcd_write(int col, int row, int min, const char *str)
 {
-    char c, *p = &text[row][col];
+    char c, *p;
     uint32_t oldpri;
+
+    if (row < 0)
+        row += lcd_rows;
+    if (col < 0)
+        col += lcd_columns;
+    if (min < 0)
+        min = lcd_columns;
+
+    p = &text[row][col];
 
     /* Prevent the text[] getting rendered while we're updating it. */
     oldpri = IRQ_save(I2C_IRQ_PRI);
 
-    while ((c = *str++) && (col++ < 16)) {
+    while ((c = *str++) && (col++ < lcd_columns)) {
         *p++ = c;
         min--;
     }
-    while ((min-- > 0) && (col++ < 16))
+    while ((min-- > 0) && (col++ < lcd_columns))
         *p++ = ' ';
 
     IRQ_restore(oldpri);
@@ -344,7 +356,12 @@ bool_t lcd_init(void)
 
         is_oled_display = (ff_cfg.display_type & DISPLAY_lcd) ? FALSE
             : (ff_cfg.display_type & DISPLAY_oled) ? TRUE
-            : (a == OLED_ADDR);
+            : ((a&~1) == OLED_ADDR); /* 0x3c = 128x32, 0x3d = 128x64 */
+
+        lcd_rows = 2;
+        lcd_columns = 16;
+        if (is_oled_display && (ff_cfg.oled_font == FONT_6x13))
+            lcd_columns = (ff_cfg.display_type & DISPLAY_narrow) ? 18 : 21;
 
         printk("I2C: %s found at 0x%02x\n",
                is_oled_display ? "OLED" : "LCD", a);
@@ -373,7 +390,7 @@ bool_t lcd_init(void)
 
     /* Timeout handler for if I2C transmission borks. */
     timer_init(&timeout_timer, timeout_fn, NULL);
-    timer_set(&timeout_timer, stk_add(stk_now(), DMA_TIMEOUT));
+    timer_set(&timeout_timer, time_now() + DMA_TIMEOUT);
 
     if (is_oled_display) {
         oled_init();
@@ -421,31 +438,32 @@ fail:
     return FALSE;
 }
 
-#ifdef font_7x16
-
-extern const uint8_t oled_font_7x16[];
-static void oled_convert_text_row_7x16(char *pc)
+extern const uint8_t oled_font_6x13[];
+static void oled_convert_text_row_6x13(char *pc)
 {
     unsigned int i, c;
     const uint8_t *p;
     uint8_t *q = (uint8_t *)buffer;
+    const unsigned int w = 6;
 
-    for (i = 0; i < 16; i++) {
+    q[0] = q[128] = 0;
+    q++;
+
+    for (i = 0; i < lcd_columns; i++) {
         if ((c = *pc++ - 0x20) > 0x5e)
             c = '.' - 0x20;
-        p = &oled_font_7x16[c * 14];
-        memcpy(q, p, 7);
-        memcpy(q+128, p+7, 7);
-        q += 7;
+        p = &oled_font_6x13[c * w * 2];
+        memcpy(q, p, w);
+        memcpy(q+128, p+w, w);
+        q += w;
     }
 
     /* Fill remainder of buffer[] with zeroes. */
-    memset(q, 0, 16);
-    memset(q+128, 0, 16);
+    memset(q, 0, 127-lcd_columns*w);
+    memset(q+128, 0, 127-lcd_columns*w);
 }
 
-#endif
-
+#ifdef font_extra
 extern const uint32_t oled_font_8x16[];
 static void oled_convert_text_row_8x16(char *pc)
 {
@@ -453,7 +471,7 @@ static void oled_convert_text_row_8x16(char *pc)
     const uint32_t *p;
     uint32_t *q = buffer;
 
-    for (i = 0; i < 16; i++) {
+    for (i = 0; i < lcd_columns; i++) {
         if ((c = *pc++ - 0x20) > 0x5e)
             c = '.' - 0x20;
         p = &oled_font_8x16[c * 4];
@@ -463,15 +481,16 @@ static void oled_convert_text_row_8x16(char *pc)
         q[32-1] = *p++;
     }
 }
+#endif
 
 static void oled_convert_text_row(char *pc)
 {
-#ifdef font_7x16
-    if (ff_cfg.oled_font == FONT_7x16)
-        oled_convert_text_row_7x16(pc);
+#ifdef font_extra
+    if (ff_cfg.oled_font == FONT_8x16)
+        oled_convert_text_row_8x16(pc);
     else
 #endif
-        oled_convert_text_row_8x16(pc);
+        oled_convert_text_row_6x13(pc);
 }
 
 static uint8_t oled_row;

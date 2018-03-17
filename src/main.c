@@ -25,7 +25,10 @@ static struct {
     struct short_slot autoboot, hxcsdfe;
     struct slot slot;
     uint32_t cfg_cdir, cur_cdir;
-    uint16_t cdir_stack[20];
+    struct {
+        uint32_t cdir;
+        uint16_t slot;
+    } stack[20];
     uint8_t depth;
     bool_t usb_power_fault;
     uint8_t hxc_mode:1;
@@ -38,8 +41,6 @@ static struct {
 } cfg;
 
 uint8_t board_id;
-
-#define LCD_SCROLL_PAUSE_MSEC  2000
 
 static uint32_t backlight_ticks;
 static uint8_t backlight_state;
@@ -79,17 +80,86 @@ static bool_t slot_type(const char *str)
     return !strcmp(cfg.slot.type, str);
 }
 
-/* Write slot info to display. */
-static void display_write_slot(void)
+#define wp_column ((lcd_columns > 16) ? 8 : 7)
+static void display_wp_status(void)
 {
-    char msg[17], *type;
+    if (display_mode != DM_LCD_1602)
+        return;
+    lcd_write(wp_column, 1, 1, (cfg.slot.attributes & AM_RDO) ? "*" : "");
+}
+
+/* Scroll long filename. */
+static struct {
+    uint16_t off, end, pause, rate;
+    int32_t ticks;
+} lcd_scroll;
+static void lcd_scroll_init(uint16_t pause, uint16_t rate)
+{
+    int diff = lcd_scroll.off - lcd_scroll.end;
+    lcd_scroll.pause = pause;
+    lcd_scroll.rate = rate;
+    lcd_scroll.end = max_t(
+        int, strnlen(cfg.slot.name, sizeof(cfg.slot.name)) - lcd_columns, 0);
+    if (lcd_scroll.end && !lcd_scroll.pause)
+        lcd_scroll.end += lcd_columns;
+    if (lcd_scroll.off > lcd_scroll.end)
+        lcd_scroll.off = lcd_scroll.pause || !lcd_scroll.end
+            ? 0 : lcd_scroll.end + diff;
+}
+static void lcd_scroll_name(void)
+{
+    char msg[25];
+    if ((lcd_scroll.ticks > 0) || (lcd_scroll.end == 0))
+        return;
+    lcd_scroll.ticks = time_ms(lcd_scroll.rate);
+    if (lcd_scroll.pause != 0) {
+        if (++lcd_scroll.off > lcd_scroll.end)
+            lcd_scroll.off = 0;
+        snprintf(msg, sizeof(msg), "%s", cfg.slot.name + lcd_scroll.off);
+        if ((lcd_scroll.off == 0)
+            || (lcd_scroll.off == lcd_scroll.end))
+            lcd_scroll.ticks = time_ms(lcd_scroll.pause);
+    } else {
+        const unsigned int scroll_gap = 4;
+        lcd_scroll.off++;
+        if (lcd_scroll.off <= lcd_scroll.end) {
+            snprintf(msg, sizeof(msg), "%s%*s%s",
+                     cfg.slot.name + lcd_scroll.off,
+                     scroll_gap, "", cfg.slot.name);
+        } else {
+            snprintf(msg, sizeof(msg), "%*s%s",
+                     scroll_gap - (lcd_scroll.off - lcd_scroll.end), "",
+                     cfg.slot.name);
+            if ((lcd_scroll.off - lcd_scroll.end) == scroll_gap)
+                lcd_scroll.off = 0;
+        }
+    }
+    lcd_write(0, 0, -1, msg);
+}
+
+/* Write slot info to display. */
+static void display_write_slot(bool_t nav_mode)
+{
+    char msg[25], *type;
     if (display_mode != DM_LCD_1602) {
         if (display_mode == DM_LED_7SEG)
             led_7seg_write_decimal(cfg.slot_nr);
         return;
     }
-    snprintf(msg, sizeof(msg), "%s", cfg.slot.name);
-    lcd_write(0, 0, 16, msg);
+    if (nav_mode) {
+        lcd_scroll_init(0, ff_cfg.nav_scroll_rate);
+        if (lcd_scroll.end == 0) {
+            snprintf(msg, sizeof(msg), "%s", cfg.slot.name);
+            lcd_write(0, 0, -1, msg);
+        } else {
+            lcd_scroll.off--;
+            lcd_scroll.ticks = 0;
+            lcd_scroll_name();
+        }
+    } else {
+        snprintf(msg, sizeof(msg), "%s", cfg.slot.name);
+        lcd_write(0, 0, -1, msg);
+    }
     type = (cfg.slot.attributes & AM_DIR) ? "DIR"
         : slot_type("adf") ? "ADF"
         : slot_type("dsk") ? "DSK"
@@ -99,56 +169,49 @@ static void display_write_slot(void)
         : slot_type("st") ? "ST "
         : slot_type("adl") ? "ADL"
         : slot_type("adm") ? "ADM"
+        : slot_type("trd") ? "TRD"
+        : slot_type("opd") ? "OPD"
         : "UNK";
+    snprintf(msg, sizeof(msg), "%03u/%03u%*s%s D:%u",
+             cfg.slot_nr, cfg.max_slot_nr,
+             (lcd_columns > 16) ? 3 : 1, "",
+             type, cfg.depth);
     if (cfg.hxc_mode) {
-        snprintf(msg, sizeof(msg), "%03u/%03u %s",
-                 cfg.slot_nr, cfg.max_slot_nr, type);
-    } else {
-        snprintf(msg, sizeof(msg), "%03u/%03u %s D:%u",
-                 cfg.slot_nr, cfg.max_slot_nr, type, cfg.depth);
+        /* HxC mode: Exclude depth from the info message. */
+        char *p = strrchr(msg, 'D');
+        if (p)
+            *p = '\0';
     }
-    lcd_write(0, 1, 16, msg);
+    lcd_write(0, 1, -1, msg);
     lcd_on();
 }
 
 /* Write track number to LCD. */
-static uint8_t lcd_cyl, lcd_side;
-static int32_t lcd_update_ticks;
 static void lcd_write_track_info(bool_t force)
 {
-    uint8_t cyl, side, sel;
+    static uint8_t lcd_cyl, lcd_side, lcd_writing;
+    uint8_t cyl, side, sel, writing;
     char msg[17];
+
     if (display_mode != DM_LCD_1602)
         return;
-    floppy_get_track(&cyl, &side, &sel);
+
+    floppy_get_track(&cyl, &side, &sel, &writing);
     cyl = min_t(uint8_t, cyl, 99);
     side = min_t(uint8_t, side, 1);
-    if (force || (cyl != lcd_cyl) || ((side != lcd_side) && sel)) {
-        snprintf(msg, sizeof(msg), "T:%02u S:%u", cyl, side);
-        lcd_write(8, 1, 0, msg);
+
+    if (force || (cyl != lcd_cyl) || ((side != lcd_side) && sel)
+        || (writing != lcd_writing)) {
+        snprintf(msg, sizeof(msg), "%c T:%02u.%u",
+                 (cfg.slot.attributes & AM_RDO) ? '*' : writing ? 'W' : ' ',
+                 cyl, side);
+        lcd_write(wp_column, 1, -1, msg);
         if (ff_cfg.display_on_activity)
             lcd_on();
         lcd_cyl = cyl;
         lcd_side = side;
+        lcd_writing = writing;
     }
-}
-
-/* Scroll long filename within 16-character window. */
-static uint8_t lcd_scroll_off, lcd_scroll_end;
-static int32_t lcd_scroll_ticks;
-static void lcd_scroll_name(void)
-{
-    char msg[17];
-    if (lcd_scroll_ticks > 0)
-        return;
-    if (++lcd_scroll_off > lcd_scroll_end)
-        lcd_scroll_off = 0;
-    snprintf(msg, sizeof(msg), "%s", cfg.slot.name + lcd_scroll_off);
-    lcd_write(0, 0, 16, msg);
-    lcd_scroll_ticks =
-        ((lcd_scroll_off == 0)
-         || (lcd_scroll_off == lcd_scroll_end))
-        ? stk_ms(LCD_SCROLL_PAUSE_MSEC) : stk_ms(ff_cfg.display_scroll_rate);
 }
 
 /* Handle switching the LCD backlight. */
@@ -251,7 +314,7 @@ static void button_timer_fn(void *unused)
 
     /* Latch final button state and reset the timer. */
     buttons = b;
-    timer_set(&button_timer, stk_add(button_timer.deadline, stk_ms(5)));
+    timer_set(&button_timer, button_timer.deadline + time_ms(5));
 }
 
 static void canary_init(void)
@@ -400,6 +463,7 @@ static void read_ff_cfg(void)
         case FFCFG_interface:
             ff_cfg.interface =
                 !strcmp(opts.arg, "ibmpc") ? FINTF_IBMPC
+                : !strcmp(opts.arg, "ibmpc-hdout") ? FINTF_IBMPC_HDOUT
                 : !strcmp(opts.arg, "shugart") ? FINTF_SHUGART
                 : FINTF_JC;
             break;
@@ -407,7 +471,15 @@ static void read_ff_cfg(void)
         case FFCFG_host:
             ff_cfg.host =
                 !strcmp(opts.arg, "akai") ? HOST_akai
+                : !strcmp(opts.arg, "acorn") ? HOST_acorn
+                : !strcmp(opts.arg, "ensoniq") ? HOST_ensoniq
+                : !strcmp(opts.arg, "gem") ? HOST_gem
                 : HOST_unspecified;
+            break;
+
+
+        case FFCFG_write_protect:
+            ff_cfg.write_protect = !strcmp(opts.arg, "yes");
             break;
 
         case FFCFG_side_select_glitch_filter:
@@ -420,8 +492,8 @@ static void read_ff_cfg(void)
                 : TRKCHG_instant;
             break;
 
-        case FFCFG_index_during_seek:
-            ff_cfg.index_during_seek = !strcmp(opts.arg, "yes");
+        case FFCFG_index_suppression:
+            ff_cfg.index_suppression = !strcmp(opts.arg, "yes");
             break;
 
             /* STARTUP / INITIALISATION */
@@ -477,6 +549,32 @@ static void read_ff_cfg(void)
 
             /* DISPLAY */
 
+        case FFCFG_display_type: {
+            char *p, *q;
+            ff_cfg.display_type = DISPLAY_auto;
+            for (p = opts.arg; *p != '\0'; p = q) {
+                for (q = p; *q && *q != '-'; q++)
+                    continue;
+                if (*q == '-')
+                    *q++ = '\0';
+                if (!strcmp(p, "lcd"))
+                    ff_cfg.display_type = DISPLAY_lcd;
+                if (!strcmp(p, "oled"))
+                    ff_cfg.display_type = DISPLAY_oled;
+                if (!strcmp(p, "rotate"))
+                    ff_cfg.display_type |= DISPLAY_rotate;
+                if (!strcmp(p, "narrow"))
+                    ff_cfg.display_type |= DISPLAY_narrow;
+            }
+            break;
+        }
+
+        case FFCFG_oled_font:
+            ff_cfg.oled_font =
+                !strcmp(opts.arg, "6x13") ? FONT_6x13
+                : FONT_8x16;
+            break;
+
         case FFCFG_display_off_secs:
             ff_cfg.display_off_secs = strtol(opts.arg, NULL, 10);
             cfg.ffcfg_has_display_off_secs = TRUE;
@@ -493,17 +591,16 @@ static void read_ff_cfg(void)
             cfg.ffcfg_has_display_scroll_rate = TRUE;
             break;
 
-        case FFCFG_oled_font:
-            ff_cfg.oled_font = !strcmp(opts.arg, "7x16")
-                ? FONT_7x16 : FONT_8x16;
+        case FFCFG_display_scroll_pause:
+            ff_cfg.display_scroll_pause = strtol(opts.arg, NULL, 10);
             break;
 
-        case FFCFG_display_type:
-            ff_cfg.display_type =
-                !strcmp(opts.arg, "lcd-16x02") ? DISPLAY_lcd_16x02
-                : !strcmp(opts.arg, "oled-128x32") ? DISPLAY_oled_128x32
-                : !strcmp(opts.arg, "oled-128x32-rotate") ? DISPLAY_oled_128x32_rotate
-                : DISPLAY_auto;
+        case FFCFG_nav_scroll_rate:
+            ff_cfg.nav_scroll_rate = strtol(opts.arg, NULL, 10);
+            break;
+
+        case FFCFG_nav_scroll_pause:
+            ff_cfg.nav_scroll_pause = strtol(opts.arg, NULL, 10);
             break;
 
             /* MISCELLANEOUS */
@@ -533,19 +630,24 @@ static void read_ff_cfg(void)
     flash_ff_cfg_update();
 }
 
-static void process_ff_cfg_opts(void)
+static void process_ff_cfg_opts(const struct ff_cfg *old)
 {
     /* interface: Inform the floppy subsystem. */
-    if (ff_cfg.interface != FINTF_JC)
-        floppy_set_fintf_mode(ff_cfg.interface);
+    floppy_set_fintf_mode(ff_cfg.interface);
 
     /* ejected-on-startup: Set the ejected state appropriately. */
     if (ff_cfg.ejected_on_startup)
         cfg.ejected = TRUE;
+
+    /* oled-font, display-type: Reinitialise the display subsystem. */
+    if ((ff_cfg.oled_font != old->oled_font)
+        || (ff_cfg.display_type != old->display_type))
+        system_reset(); /* hit it with a hammer */
 }
 
 static void cfg_init(void)
 {
+    struct ff_cfg old_ff_cfg = ff_cfg;
     struct hxcsdfe_cfg hxc_cfg;
     unsigned int sofar;
     char *p;
@@ -561,7 +663,7 @@ static void cfg_init(void)
     cfg.cfg_cdir = fatfs.cdir;
 
     read_ff_cfg();
-    process_ff_cfg_opts();
+    process_ff_cfg_opts(&old_ff_cfg);
 
     switch (ff_cfg.nav_mode) {
     case NAVMODE_native:
@@ -604,6 +706,7 @@ static void cfg_init(void)
     if (fr)
         goto native_mode;
     fatfs_to_short_slot(&cfg.autoboot, &fs->file, "AUTOBOOT.HFE");
+    cfg.autoboot.attributes |= AM_RDO; /* default read-only */
     F_close(&fs->file);
 
     cfg.hxc_mode = TRUE;
@@ -626,6 +729,8 @@ native_mode:
     sofar = 0; /* bytes consumed so far */
     fatfs.cdir = cfg.cur_cdir;
     for (;;) {
+        unsigned int nr = cfg.depth ? 1 : 0;
+        bool_t ok;
         /* Read next pathname section, search for its terminating slash. */
         F_read(&fs->file, fs->buf, sizeof(fs->buf), NULL);
         fs->buf[sizeof(fs->buf)-1] = '\0';
@@ -637,9 +742,17 @@ native_mode:
         /* Terminate the name section, push curdir onto stack, then chdir. */
         *p++ = '\0';
         printk("%u:D: '%s'\n", cfg.depth, fs->buf);
-        if (cfg.depth == ARRAY_SIZE(cfg.cdir_stack))
+        if (cfg.depth == ARRAY_SIZE(cfg.stack))
             F_die(FR_PATH_TOO_DEEP);
-        cfg.cdir_stack[cfg.depth++] = fatfs.cdir;
+        /* Find slot nr, and stack it */
+        F_opendir(&fs->dp, "");
+        while ((ok = native_dir_next()) && strcmp(fs->fp.fname, fs->buf))
+            nr++;
+        F_closedir(&fs->dp);
+        if (!ok)
+            goto clear_image_a;
+        cfg.stack[cfg.depth].slot = nr;
+        cfg.stack[cfg.depth++].cdir = fatfs.cdir;
         fr = f_chdir(fs->buf);
         if (fr)
             goto clear_image_a;
@@ -1025,13 +1138,15 @@ static void cfg_update(uint8_t slot_mode)
         hxc_cfg_update(slot_mode);
     else
         native_update(slot_mode);
+    if (!(cfg.slot.attributes & AM_DIR) && ff_cfg.write_protect)
+        cfg.slot.attributes |= AM_RDO;
 }
 
 /* Based on button presses, change which floppy image is selected. */
 static bool_t choose_new_image(uint8_t init_b)
 {
     uint8_t b, prev_b;
-    stk_time_t last_change = 0;
+    time_t last_change = 0;
     int old_slot = cfg.slot_nr, i, changes = 0;
 
     for (prev_b = 0, b = init_b;
@@ -1040,10 +1155,10 @@ static bool_t choose_new_image(uint8_t init_b)
 
         if (prev_b == b) {
             /* Decaying delay between image steps while button pressed. */
-            stk_time_t delay = stk_ms(1000) / (changes + 1);
-            if (delay < stk_ms(50))
-                delay = stk_ms(50);
-            if (stk_diff(last_change, stk_now()) < delay)
+            time_t delay = time_ms(1000) / (changes + 1);
+            if (delay < time_ms(50))
+                delay = time_ms(50);
+            if (time_diff(last_change, time_now()) < delay)
                 continue;
             changes++;
         } else {
@@ -1051,7 +1166,7 @@ static bool_t choose_new_image(uint8_t init_b)
              * the continuous-press decaying delay. */
             changes = 0;
         }
-        last_change = stk_now();
+        last_change = time_now();
 
         i = cfg.slot_nr;
         if (!(b ^ (B_LEFT|B_RIGHT))) {
@@ -1064,16 +1179,17 @@ static bool_t choose_new_image(uint8_t init_b)
             i = cfg.slot_nr = 0;
             cfg_update(CFG_KEEP_SLOT_NR);
             if (ff_cfg.twobutton_action == TWOBUTTON_rotary) {
-                /* Wait for button release, then update display, then
+                /* Wait for button release, then update display, or
                  * immediately enter parent-dir (if we're in a subfolder). */
                 while (buttons)
                     continue;
-                display_write_slot();
+                if (cfg.depth == 0)
+                    display_write_slot(TRUE);
                 return (cfg.depth != 0);
             }
-            display_write_slot();
+            display_write_slot(TRUE);
             /* Ignore changes while user is releasing the buttons. */
-            while ((stk_diff(last_change, stk_now()) < stk_ms(1000))
+            while ((time_diff(last_change, time_now()) < time_ms(1000))
                    && buttons)
                 continue;
         } else if (b & B_LEFT) {
@@ -1098,7 +1214,7 @@ static bool_t choose_new_image(uint8_t init_b)
 
         cfg.slot_nr = i;
         cfg_update(CFG_KEEP_SLOT_NR);
-        display_write_slot();
+        display_write_slot(TRUE);
     }
 
     return FALSE;
@@ -1113,26 +1229,23 @@ static void assert_usbh_msc_connected(void)
 static int run_floppy(void *_b)
 {
     volatile uint8_t *pb = _b;
-    stk_time_t t_now, t_prev, t_diff;
+    time_t t_now, t_prev, t_diff;
+    int32_t lcd_update_ticks;
 
     floppy_insert(0, &cfg.slot);
 
-    lcd_update_ticks = stk_ms(20);
-    lcd_scroll_ticks = stk_ms(LCD_SCROLL_PAUSE_MSEC);
-    lcd_scroll_off = 0;
-    lcd_scroll_end = max_t(
-        int, strnlen(cfg.slot.name, sizeof(cfg.slot.name)) - 16, 0);
-    t_prev = stk_now();
+    lcd_update_ticks = time_ms(20);
+    t_prev = time_now();
     while (((*pb = buttons) == 0) && !floppy_handle()) {
-        t_now = stk_now();
-        t_diff = stk_diff(t_prev, t_now);
+        t_now = time_now();
+        t_diff = time_diff(t_prev, t_now);
         if (display_mode == DM_LCD_1602) {
             lcd_update_ticks -= t_diff;
             if (lcd_update_ticks <= 0) {
                 lcd_write_track_info(FALSE);
-                lcd_update_ticks = stk_ms(20);
+                lcd_update_ticks = time_ms(20);
             }
-            lcd_scroll_ticks -= t_diff;
+            lcd_scroll.ticks -= t_diff;
             lcd_scroll_name();
         }
         canary_check();
@@ -1163,12 +1276,18 @@ static int floppy_main(void *unused)
 
     /* If we start on a folder, go directly into the image selector. */
     if (cfg.slot.attributes & AM_DIR) {
-        display_write_slot();
+        display_write_slot(FALSE);
         b = buttons;
         goto select;
     }
 
     for (;;) {
+
+        lcd_scroll.ticks = time_ms(ff_cfg.display_scroll_pause)
+            ?: time_ms(ff_cfg.display_scroll_rate);
+        lcd_scroll.off = lcd_scroll.end = 0;
+        lcd_scroll_init(ff_cfg.display_scroll_pause,
+                        ff_cfg.display_scroll_rate);
 
         /* Make sure slot index is on a valid slot. Find next valid slot if 
          * not (and update config). */
@@ -1186,25 +1305,26 @@ static int floppy_main(void *unused)
             if (!strcmp(fs->fp.fname, "..")) {
                 if (cfg.depth == 0)
                     F_die(FR_BAD_IMAGECFG);
-                fatfs.cdir = cfg.cur_cdir = cfg.cdir_stack[--cfg.depth];
-                cfg.slot_nr = 0;
+                fatfs.cdir = cfg.cur_cdir = cfg.stack[--cfg.depth].cdir;
+                cfg.slot_nr = cfg.stack[cfg.depth].slot;
             } else {
-                if (cfg.depth == ARRAY_SIZE(cfg.cdir_stack))
+                if (cfg.depth == ARRAY_SIZE(cfg.stack))
                     F_die(FR_PATH_TOO_DEEP);
-                cfg.cdir_stack[cfg.depth++] = cfg.cur_cdir;
+                cfg.stack[cfg.depth].slot = cfg.slot_nr;
+                cfg.stack[cfg.depth++].cdir = cfg.cur_cdir;
                 F_chdir(fs->fp.fname);
                 cfg.cur_cdir = fatfs.cdir;
                 cfg.slot_nr = 1;
             }
             cfg_update(CFG_READ_SLOT_NR);
-            display_write_slot();
+            display_write_slot(FALSE);
             b = buttons;
             goto select;
         }
 
         fs = NULL;
 
-        display_write_slot();
+        display_write_slot(FALSE);
         if (display_mode == DM_LCD_1602)
             lcd_write_track_info(TRUE);
 
@@ -1228,7 +1348,7 @@ static int floppy_main(void *unused)
         /* When an image is loaded, select button means eject. */
         if (fres || (b & B_SELECT)) {
             /* ** EJECT STATE ** */
-            unsigned int wait = 0;
+            unsigned int wait;
             snprintf(msg, sizeof(msg), "EJECTED");
             switch (display_mode) {
             case DM_LED_7SEG:
@@ -1241,7 +1361,9 @@ static int floppy_main(void *unused)
                 if (fres)
                     snprintf(msg, sizeof(msg), "*%s*%02u*",
                              (fres >= 30) ? "ERR" : "FAT", fres);
-                lcd_write(8, 1, 8, msg);
+                display_wp_status();
+                lcd_write(wp_column+1, 1, -1, "");
+                lcd_write((lcd_columns > 16) ? 10 : 8, 1, 0, msg);
                 lcd_on();
                 break;
             }
@@ -1249,9 +1371,21 @@ static int floppy_main(void *unused)
                 ima_mark_ejected(TRUE);
             fres = FR_OK;
             /* Wait for buttons to be released. */
-            while (buttons != 0)
-                continue;
+            wait = 0;
+            while (buttons != 0) {
+                delay_ms(1);
+                if (wait++ >= 2000) {
+                toggle_wp:
+                    wait = 0;
+                    cfg.slot.attributes ^= AM_RDO;
+                    display_wp_status();
+                    if (display_mode == DM_LED_7SEG)
+                        led_7seg_write_string((cfg.slot.attributes & AM_RDO)
+                                              ? "RDO" : "RIT");
+                }
+            }
             /* Wait for any button to be pressed. */
+            wait = 0;
             while ((b = buttons) == 0) {
                 /* Bail if USB disconnects. */
                 assert_usbh_msc_connected();
@@ -1274,7 +1408,7 @@ static int floppy_main(void *unused)
                     break;
                 case DM_LCD_1602:
                     /* Continue to scroll long filename. */
-                    lcd_scroll_ticks -= stk_ms(1);
+                    lcd_scroll.ticks -= time_ms(1);
                     lcd_scroll_name();
                     break;
                 }
@@ -1293,12 +1427,16 @@ static int floppy_main(void *unused)
             /* Reload same image immediately if eject pressed again. */
             if (b & B_SELECT) {
                 /* Wait for eject button to be released. */
+                wait = 0;
                 while (b & B_SELECT) {
                     b = buttons;
                     if ((ff_cfg.twobutton_action == TWOBUTTON_eject) && b) {
                         /* Wait for 2-button release. */
                         b = B_SELECT;
                     }
+                    delay_ms(1);
+                    if (wait++ >= 2000)
+                        goto toggle_wp;
                 }
                 ima_mark_ejected(FALSE);
                 continue;
@@ -1312,8 +1450,9 @@ static int floppy_main(void *unused)
         }
 
     select:
+        lcd_scroll.off = lcd_scroll.end = 0;
         do {
-            unsigned int wait_secs;
+            unsigned int wait_ms;
 
             /* While buttons are pressed we poll them and update current image
              * accordingly. */
@@ -1323,14 +1462,25 @@ static int floppy_main(void *unused)
 
             /* Wait a few seconds for further button presses before acting on 
              * the new image selection. */
-            wait_secs = (cfg.slot.attributes & AM_DIR) ?
+            lcd_scroll_init(0, ff_cfg.nav_scroll_rate);
+            lcd_scroll.ticks = time_ms(ff_cfg.nav_scroll_pause);
+            wait_ms = (cfg.slot.attributes & AM_DIR) ?
                 ff_cfg.autoselect_folder_secs : ff_cfg.autoselect_file_secs;
-            for (i = 0; (wait_secs == 0) || (i < wait_secs*1000); i++) {
+            wait_ms *= 1000;
+            if (wait_ms && (display_mode == DM_LCD_1602)) {
+                /* Allow time for full name to scroll through. */
+                unsigned int scroll_ms = ff_cfg.nav_scroll_pause;
+                scroll_ms += lcd_scroll.end * ff_cfg.nav_scroll_rate;
+                wait_ms = max(wait_ms, scroll_ms);
+            }
+            for (i = 0; (wait_ms == 0) || (i < wait_ms); i++) {
                 b = buttons;
                 if (b != 0)
                     break;
                 assert_usbh_msc_connected();
                 delay_ms(1);
+                lcd_scroll.ticks -= time_ms(1);
+                lcd_scroll_name();
             }
 
             /* Flash the LED display to indicate loading the new image. */
@@ -1439,8 +1589,8 @@ static void handle_errors(FRESULT fres)
         led_7seg_write_string(msg);
         break;
     case DM_LCD_1602:
-        lcd_write(0, 0, 16, "***************");
-        lcd_write(0, 1, 16, msg);
+        lcd_write(0, 0, -1, "***************");
+        lcd_write(0, 1, -1, msg);
         lcd_on();
         break;
     }
@@ -1461,7 +1611,6 @@ static void handle_errors(FRESULT fres)
 int main(void)
 {
     FRESULT fres;
-    uint8_t fintf_mode;
 
     /* Relocate DATA. Initialise BSS. */
     if (_sdat != _ldat)
@@ -1470,7 +1619,7 @@ int main(void)
 
     canary_init();
     stm32_init();
-    timers_init();
+    time_init();
     console_init();
     console_crash_on_input();
     board_init();
@@ -1487,14 +1636,7 @@ int main(void)
 
     flash_ff_cfg_read();
 
-    fintf_mode = ff_cfg.interface;
-    if (fintf_mode == FINTF_JC) {
-        /* Jumper JC selects default floppy interface configuration:
-         *   - No Jumper: Shugart
-         *   - Jumpered:  IBM PC */
-        fintf_mode = gpio_read_pin(gpiob, 1) ? FINTF_SHUGART : FINTF_IBMPC;
-    }
-    floppy_init(fintf_mode);
+    floppy_init(ff_cfg.interface);
 
     display_init();
 
@@ -1503,7 +1645,7 @@ int main(void)
     if (ff_cfg.rotary == ROT_gray)
         rotary = (gpioc->idr >> 10) & 3;
     timer_init(&button_timer, button_timer_fn, NULL);
-    timer_set(&button_timer, stk_now());
+    timer_set(&button_timer, time_now());
 
     for (;;) {
 

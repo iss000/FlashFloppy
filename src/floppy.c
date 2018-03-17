@@ -15,10 +15,10 @@
 
 #define m(bitnr) (1u<<(bitnr))
 
-/* A soft IRQ for handling step pulses. */
+/* A soft IRQ for handling lower priority work items. */
 static void drive_step_timer(void *_drv);
-void IRQ_43(void) __attribute__((alias("IRQ_step")));
-#define STEP_IRQ 43
+void IRQ_43(void) __attribute__((alias("IRQ_soft")));
+#define FLOPPY_SOFTIRQ 43
 
 /* A DMA buffer for running a timer associated with a floppy-data I/O pin. */
 struct dma_ring {
@@ -28,10 +28,10 @@ struct dma_ring {
      *  DMA_active: DMA is active, timer is operational. 
      *  DMA_stopping: DMA+timer halted, buffer waiting to be cleared. 
      * Current state of DMA (WDATA): 
-     *  DMA_inactive: No activity, flux ring and MFM buffer are empty. 
-     *  DMA_starting: Flux ring and MFM buffer are filling, DMA+timer active.
+     *  DMA_inactive: No activity, flux ring and bitcell buffer are empty. 
+     *  DMA_starting: Flux ring and bitcell buffer are filling.
      *  DMA_active: Writeback processing is active (to mass storage).
-     *  DMA_stopping: DMA+timer halted, buffers waiting to be cleared. */
+     *  DMA_stopping: Timer halted, buffers waiting to be cleared. */
 #define DMA_inactive 0 /* -> {starting, active} */
 #define DMA_starting 1 /* -> {active, stopping} */
 #define DMA_active   2 /* -> {stopping} */
@@ -57,7 +57,6 @@ static struct dma_ring *dma_wr; /* WDATA DMA buffer */
 /* Statically-allocated floppy drive state. Tracks head movements and 
  * side changes at all times, even when the drive is empty. */
 static struct drive {
-    const struct slot *slot;
     uint8_t cyl, head, nr_sides;
     bool_t writing;
     bool_t sel;
@@ -67,7 +66,8 @@ static struct drive {
 #define outp_trk0   2
 #define outp_wrprot 3
 #define outp_rdy    4
-#define outp_nr     5
+#define outp_hden   5
+#define outp_nr     6
     uint8_t outp;
     struct {
 #define STEP_started  1 /* started by hi-pri IRQ */
@@ -76,7 +76,7 @@ static struct drive {
 #define STEP_settling 4 /* handled by step.timer */
         uint8_t state;
         bool_t inward;
-        stk_time_t start;
+        time_t start;
         struct timer timer;
     } step;
     uint32_t restart_pos;
@@ -84,11 +84,12 @@ static struct drive {
 } drive;
 
 static struct image *image;
-static stk_time_t sync_time, sync_pos;
+static time_t sync_time, sync_pos;
 
 static struct {
     struct timer timer, timer_deassert;
-    stk_time_t prev_time;
+    time_t prev_time;
+    bool_t fake_fired;
 } index;
 static void index_assert(void *);   /* index.timer */
 static void index_deassert(void *); /* index.timer_deassert */
@@ -120,13 +121,22 @@ const static uint8_t *fintf, fintfs[][outp_nr] = {
         [outp_index]  = pin_08,
         [outp_trk0]   = pin_26,
         [outp_wrprot] = pin_28,
-        [outp_rdy]    = pin_34 },
+        [outp_rdy]    = pin_34,
+        [outp_hden]   = pin_unset },
     [FINTF_IBMPC] = {
         [outp_dskchg] = pin_34,
         [outp_index]  = pin_08,
         [outp_trk0]   = pin_26,
         [outp_wrprot] = pin_28,
-        [outp_rdy]    = pin_unset }
+        [outp_rdy]    = pin_unset,
+        [outp_hden]   = pin_unset },
+    [FINTF_IBMPC_HDOUT] = {
+        [outp_dskchg] = pin_34,
+        [outp_index]  = pin_08,
+        [outp_trk0]   = pin_26,
+        [outp_wrprot] = pin_28,
+        [outp_rdy]    = pin_unset,
+        [outp_hden]   = pin_02 },
 };
 
 static void drive_change_output(struct drive *drv, uint8_t outp, bool_t assert)
@@ -157,24 +167,27 @@ void floppy_cancel(void)
      * Asserting WRPROT prevents any further calls to wdata_start(). */
     drive_change_output(drv, outp_rdy, FALSE);
     drive_change_output(drv, outp_wrprot, TRUE);
+    drive_change_output(drv, outp_hden, FALSE);
 
-    /* Stop DMA/timer work. */
+    /* Stop DMA + timer work. */
     IRQx_disable(dma_rdata_irq);
     IRQx_disable(dma_wdata_irq);
-    timer_cancel(&index.timer);
-    timer_cancel(&index.timer_deassert);
     rdata_stop();
     wdata_stop();
     dma_rdata.ccr = 0;
     dma_wdata.ccr = 0;
 
     /* Clear soft state. */
+    timer_cancel(&index.timer);
+    barrier(); /* cancel index.timer /then/ clear soft state */
     drive.index_suppressed = FALSE;
     drive.image = NULL;
-    drive.slot = NULL;
     max_read_us = 0;
     image = NULL;
     dma_rd = dma_wr = NULL;
+    index.fake_fired = FALSE;
+    barrier(); /* clear soft state /then/ cancel index.timer_deassert */
+    timer_cancel(&index.timer_deassert);
 
     /* Set outputs for empty drive. */
     barrier();
@@ -191,13 +204,24 @@ static struct dma_ring *dma_ring_alloc(void)
 
 void floppy_set_fintf_mode(uint8_t fintf_mode)
 {
-    static const char * const fintf_name[] = { "Shugart", "IBM PC" };
+    static const char * const fintf_name[] = {
+        [FINTF_SHUGART] = "Shugart",
+        [FINTF_IBMPC] = "IBM PC",
+        [FINTF_IBMPC_HDOUT] = "IBM PC + HD_OUT"
+    };
     struct drive *drv = &drive;
     uint32_t old_active;
     uint8_t outp;
 
+    if (fintf_mode == FINTF_JC) {
+        /* Jumper JC selects default floppy interface configuration:
+         *   - No Jumper: Shugart
+         *   - Jumpered:  IBM PC */
+        fintf_mode = gpio_read_pin(gpiob, 1) ? FINTF_SHUGART : FINTF_IBMPC;
+    }
+
     /* Invalid interface mode? Do nothing. */
-    if (fintf_mode >= ARRAY_SIZE(fintf_name))
+    if (fintf_mode >= ARRAY_SIZE(fintfs))
         return;
 
     /* This mode is already set? Do nothing. */
@@ -271,8 +295,8 @@ void floppy_init(uint8_t fintf_mode)
         IRQx_enable(e->irq);
     }
 
-    IRQx_set_prio(STEP_IRQ, FLOPPY_IRQ_LO_PRI);
-    IRQx_enable(STEP_IRQ);
+    IRQx_set_prio(FLOPPY_SOFTIRQ, FLOPPY_SOFTIRQ_PRI);
+    IRQx_enable(FLOPPY_SOFTIRQ);
 
     timer_init(&index.timer, index_assert, NULL);
     timer_init(&index.timer_deassert, index_deassert, NULL);
@@ -291,40 +315,29 @@ void floppy_insert(unsigned int unit, const struct slot *slot)
     memset(image, 0, sizeof(*image));
 
     /* Large buffer to absorb long write latencies at mass-storage layer. */
-    image->bufs.write_mfm.len = 20*1024;
-    image->bufs.write_mfm.p = arena_alloc(image->bufs.write_mfm.len);
+    image->bufs.write_bc.len = 16*1024; /* 16kB, power of two. */
+    image->bufs.write_bc.p = arena_alloc(image->bufs.write_bc.len);
 
-    /* Any remaining space is used for staging writes to mass storage, for 
-     * example when format conversion is required and it is not possible to 
-     * do this in place within the write_mfm buffer. */
+    /* Smaller buffer for absorbing read latencies at mass-storage layer. */
+    image->bufs.read_bc.len = 8*1024; /* 8kB, power of two. */
+    image->bufs.read_bc.p = arena_alloc(image->bufs.read_bc.len);
+
+    /* Any remaining space is used for staging I/O to mass storage, shared
+     * between read and write paths (Change of use of this memory space is
+     * fully serialised). */
     image->bufs.write_data.len = arena_avail();
     image->bufs.write_data.p = arena_alloc(image->bufs.write_data.len);
-
-    /* Read MFM buffer overlaps the second half of the write MFM buffer.
-     * This is because:
-     *  (a) The read MFM buffer does not need to absorb such large latencies
-     *      (reads are much more predictable than writes to mass storage).
-     *  (b) By dedicating the first half of the write buffer to writes, we
-     *      can safely start processing write flux while read-data is still
-     *      processing (eg. in-flight mass storage io). At say 10kB of
-     *      dedicated write buffer, this is good for >80ms before colliding
-     *      with read buffers, even at HD data rate (1us/bitcell).
-     *      This is more than enough time for read
-     *      processing to complete. */
-    image->bufs.read_mfm.len = image->bufs.write_mfm.len / 2;
-    image->bufs.read_mfm.p = (char *)image->bufs.write_mfm.p
-        + image->bufs.read_mfm.len;
-
-    /* Read-data buffer can entirely share the space of the write-data buffer. 
-     * Change of use of this memory space is fully serialised. */
     image->bufs.read_data = image->bufs.write_data;
 
-    drv->slot = slot;
+    image_open(image, slot);
+    drv->image = image;
+    dma_rd->state = DMA_stopping;
+
+    if (image->write_bc_ticks < sysclk_ns(1500))
+        drive_change_output(drv, outp_hden, TRUE);
 
     drv->index_suppressed = FALSE;
-    index.prev_time = stk_now();
-    timer_set(&index.timer, stk_add(index.prev_time,
-                                    stk_ms(DRIVE_MS_PER_REV)));
+    index.prev_time = time_now();
 
     /* Enable DMA interrupts. */
     dma1->ifcr = DMA_IFCR_CGIF(dma_rdata_ch) | DMA_IFCR_CGIF(dma_wdata_ch);
@@ -389,16 +402,39 @@ void floppy_insert(unsigned int unit, const struct slot *slot)
                      DMA_CCR_TCIE |
                      DMA_CCR_EN);
 
-    /* Drive is 'ready'. */
+    /* Drive is ready. Set output signals appropriately. */
     drive_change_output(drv, outp_rdy, TRUE);
+    if ((slot->attributes & AM_RDO)
+        || !image->handler->write_track) {
+        printk("Image is R/O %s%s\n",
+               (slot->attributes & AM_RDO) ? "[fat-attr]" : "",
+               !image->handler->write_track ? "[no-handler]" : "");
+    } else {
+        drive_change_output(drv, outp_wrprot, FALSE);
+    }
+}
+
+static unsigned int drive_calc_track(struct drive *drv)
+{
+    drv->nr_sides = (drv->cyl == 255) ? 1 : drv->image->nr_sides;
+    return drv->cyl*2 + (drv->head & (drv->nr_sides - 1));
+}
+
+/* Find current rotational position for read-stream restart. */
+static void drive_set_restart_pos(struct drive *drv)
+{
+    uint32_t pos = max_t(int32_t, 0, time_diff(index.prev_time, time_now()));
+    pos %= drv->image->stk_per_rev;
+    drv->restart_pos = pos;
+    drv->index_suppressed = TRUE;
 }
 
 /* Called from IRQ context to stop the write stream. */
 static void wdata_stop(void)
 {
     struct write *write;
+    struct drive *drv = &drive;
     uint8_t prev_state = dma_wr->state;
-    uint32_t pos;
 
     /* Already inactive? Nothing to do. */
     if ((prev_state == DMA_inactive) || (prev_state == DMA_stopping))
@@ -414,19 +450,23 @@ static void wdata_stop(void)
     /* Drain out the DMA buffer. */
     IRQx_set_pending(dma_wdata_irq);
 
-    /* No more IDX pulses until write-out is complete. */
-    drive.index_suppressed = TRUE;
-
-    /* Find rotational end position of the write. We will restart the read 
-     * stream at exactly this point. */
-    pos = max_t(int32_t, 0, stk_delta(index.prev_time, stk_now()));
-    pos %= stk_ms(DRIVE_MS_PER_REV);
-    drive.restart_pos = pos;
+    /* Restart read exactly where write ended. 
+     * No more IDX pulses until write-out is complete. */
+    drive_set_restart_pos(drv);
 
     /* Remember where this write's DMA stream ended. */
     write = get_write(image, image->wr_prod);
     write->dma_end = ARRAY_SIZE(dma_wr->buf) - dma_wdata.cndtr;
     image->wr_prod++;
+
+    if (!ff_cfg.index_suppression) {
+        /* Opportunistically insert an INDEX pulse ahead of writeback. */
+        drive_change_output(drv, outp_index, TRUE);
+        index.fake_fired = TRUE;
+        IRQx_set_pending(FLOPPY_SOFTIRQ);
+        /* Position read head so it quickly triggers an INDEX pulse. */
+        drv->restart_pos = drv->image->stk_per_rev - stk_ms(20);
+    }
 }
 
 static void wdata_start(void)
@@ -460,12 +500,13 @@ static void wdata_start(void)
     tim_wdata->sr = 0; /* dummy write, gives h/w time to process EGR.UG=1 */
     tim_wdata->cr1 = TIM_CR1_CEN;
 
-    /* Find rotational start position of the write, in systicks since index. */
-    start_pos = max_t(int32_t, 0, stk_delta(index.prev_time, stk_now()));
-    start_pos %= stk_ms(DRIVE_MS_PER_REV);
+    /* Find rotational start position of the write, in SYSCLK ticks. */
+    start_pos = max_t(int32_t, 0, time_diff(index.prev_time, time_now()));
+    start_pos %= drive.image->stk_per_rev;
     start_pos *= SYSCLK_MHZ / STK_MHZ;
     write = get_write(image, image->wr_prod);
     write->start = start_pos;
+    write->track = drive_calc_track(&drive);
 
     /* Allow IDX pulses while handling a write. */
     drive.index_suppressed = FALSE;
@@ -478,7 +519,6 @@ static void wdata_start(void)
 static void rdata_stop(void)
 {
     uint8_t prev_state = dma_rd->state;
-    uint32_t pos;
 
     /* Already inactive? Nothing to do. */
     if (prev_state == DMA_inactive)
@@ -497,14 +537,11 @@ static void rdata_stop(void)
     /* Turn off timer. */
     tim_rdata->cr1 = 0;
 
-    if ((ff_cfg.track_change == TRKCHG_instant) && !drive.index_suppressed) {
-        /* Find rotational end position of the read. We will restart the read
-         * stream at exactly this point. */
-        pos = max_t(int32_t, 0, stk_delta(index.prev_time, stk_now()));
-        pos %= stk_ms(DRIVE_MS_PER_REV);
-        drive.restart_pos = pos;
-        drive.index_suppressed = TRUE;
-    }
+    /* track-change = instant: Restart read stream where we left off. */
+    if ((ff_cfg.track_change == TRKCHG_instant)
+        && !drive.index_suppressed
+        && ff_cfg.index_suppression)
+        drive_set_restart_pos(&drive);
 }
 
 /* Called from user context to start the read stream. */
@@ -555,33 +592,43 @@ static void floppy_sync_flux(void)
         return;
 
     if (!drv->index_suppressed) {
-        ticks = stk_delta(stk_now(), sync_time) - stk_us(1);
-        if (ticks > stk_ms(15)) {
+        ticks = time_diff(time_now(), sync_time) - time_us(1);
+        if (ticks > time_ms(15)) {
             /* Too long to wait. Immediately re-sync index timing. */
             drv->index_suppressed = TRUE;
             printk("Trk %u: skip %ums\n",
-                   drv->image->cur_track, (ticks+stk_us(500))/stk_ms(1));
-        } else if (ticks > stk_ms(5)) {
+                   drv->image->cur_track, (ticks+time_us(500))/time_ms(1));
+        } else if (ticks > time_ms(5)) {
             /* A while to wait. Go do other work. */
             return;
         } else {
             if (ticks > 0)
                 delay_ticks(ticks);
             /* If we're out of sync then forcibly re-sync index timing. */
-            ticks = stk_delta(stk_now(), sync_time);
+            ticks = time_diff(time_now(), sync_time);
             if (ticks < -100) {
                 drv->index_suppressed = TRUE;
                 printk("Trk %u: late %uus\n",
-                       drv->image->cur_track, -ticks/stk_us(1));
+                       drv->image->cur_track, -ticks/time_us(1));
             }
         }
+    } else if (drv->step.state) {
+        /* IDX is suppressed: Wait for heads to settle.
+         * When IDX is not suppressed, settle time is already accounted for in
+         * dma_rd_handle()'s call to image_setup_track(). */
+        time_t step_settle = drv->step.start + time_ms(DRIVE_SETTLE_MS);
+        int32_t delta = time_diff(time_now(), step_settle) - time_us(1);
+        if (delta > time_ms(5))
+            return; /* go do other work for a while */
+        if (delta > 0)
+            delay_ticks(delta);
     }
 
     if (drv->index_suppressed) {
         /* Re-enable index timing, snapped to the new read stream. */
         timer_cancel(&index.timer);
         IRQ_global_disable();
-        index.prev_time = stk_sub(stk_now(), sync_pos);
+        index.prev_time = time_now() - sync_pos;
         drv->index_suppressed = FALSE;
     }
 
@@ -591,10 +638,10 @@ static void floppy_sync_flux(void)
 static void floppy_read_data(struct drive *drv)
 {
     uint32_t read_us;
-    stk_time_t timestamp;
+    time_t timestamp;
 
     /* Read some track data if there is buffer space. */
-    timestamp = stk_now();
+    timestamp = time_now();
     if (image_read_track(drv->image) && dma_rd->kick_dma_irq) {
         /* We buffered some more data and the DMA handler requested a kick. */
         dma_rd->kick_dma_irq = FALSE;
@@ -602,17 +649,11 @@ static void floppy_read_data(struct drive *drv)
     }
 
     /* Log maximum time taken to read track data, in microseconds. */
-    read_us = stk_diff(timestamp, stk_now()) / STK_MHZ;
+    read_us = time_diff(timestamp, time_now()) / TIME_MHZ;
     if (read_us > max_read_us) {
         max_read_us = max_t(uint32_t, max_read_us, read_us);
         printk("New max: read_us=%u\n", max_read_us);
     }
-}
-
-static unsigned int drive_calc_track(struct drive *drv)
-{
-    drv->nr_sides = (drv->cyl == 255) ? 1 : drv->image->nr_sides;
-    return drv->cyl*2 + (drv->head & (drv->nr_sides - 1));
 }
 
 static bool_t dma_rd_handle(struct drive *drv)
@@ -620,15 +661,14 @@ static bool_t dma_rd_handle(struct drive *drv)
     switch (dma_rd->state) {
 
     case DMA_inactive: {
-        stk_time_t index_time, read_start_pos;
+        time_t index_time, read_start_pos;
         unsigned int track;
         /* Allow 10ms from current rotational position to load new track */
-        int32_t delay = stk_ms(10);
+        int32_t delay = time_ms(10);
         /* Allow extra time if heads are settling. */
         if (drv->step.state & STEP_settling) {
-            stk_time_t step_settle = stk_add(drv->step.start,
-                                             stk_ms(DRIVE_SETTLE_MS));
-            int32_t delta = stk_delta(stk_now(), step_settle);
+            time_t step_settle = drv->step.start + time_ms(DRIVE_SETTLE_MS);
+            int32_t delta = time_diff(time_now(), step_settle);
             delay = max_t(int32_t, delta, delay);
         }
         /* No data fetch while stepping. */
@@ -639,20 +679,24 @@ static bool_t dma_rd_handle(struct drive *drv)
         index_time = index.prev_time;
         read_start_pos = drv->index_suppressed
             ? drive.restart_pos /* start read exactly where write ended */
-            : stk_timesince(index_time) + delay;
-        read_start_pos %= stk_ms(DRIVE_MS_PER_REV);
+            : time_since(index_time) + delay;
+        read_start_pos %= drv->image->stk_per_rev;
         /* Seek to the new track. */
         track = drive_calc_track(drv);
         read_start_pos *= SYSCLK_MHZ/STK_MHZ;
-        if (image_seek_track(drv->image, track, &read_start_pos))
+        if ((track >= 510) && (drv->outp & m(outp_wrprot))) {
+            /* Remove write-protect when driven into D-A mode. */
+            drive_change_output(drv, outp_wrprot, FALSE);
+        }
+        if (image_setup_track(drv->image, track, &read_start_pos))
             return TRUE;
         read_start_pos /= SYSCLK_MHZ/STK_MHZ;
         sync_pos = read_start_pos;
         if (!drv->index_suppressed) {
             /* Set the deadline to match existing index timing. */
-            sync_time = stk_add(index_time, read_start_pos);
-            if (stk_delta(stk_now(), sync_time) < 0)
-                sync_time = stk_add(sync_time, stk_ms(DRIVE_MS_PER_REV));
+            sync_time = index_time + read_start_pos;
+            if (time_diff(time_now(), sync_time) < 0)
+                sync_time += drv->image->stk_per_rev;
         }
         /* Change state /then/ check for race against step or side change. */
         dma_rd->state = DMA_starting;
@@ -679,8 +723,7 @@ static bool_t dma_rd_handle(struct drive *drv)
             ARRAY_SIZE(dma_rd->buf) - dma_rdata.cndtr;
         /* Free-running index timer. */
         timer_cancel(&index.timer);
-        timer_set(&index.timer, stk_add(index.prev_time,
-                                        stk_ms(DRIVE_MS_PER_REV)));
+        timer_set(&index.timer, index.prev_time + drv->image->stk_per_rev);
         break;
     }
 
@@ -690,7 +733,7 @@ static bool_t dma_rd_handle(struct drive *drv)
 static bool_t dma_wr_handle(struct drive *drv)
 {
     struct image *im = drv->image;
-    struct write *write;
+    struct write *write = get_write(im, im->wr_cons);
     bool_t completed;
 
     ASSERT((dma_wr->state == DMA_starting) || (dma_wr->state == DMA_stopping));
@@ -706,8 +749,8 @@ static bool_t dma_wr_handle(struct drive *drv)
             ASSERT(dma_rd->state == DMA_inactive);
         }
     
-        /* Make sure we're on the correct track. */
-        if (image_seek_track(im, drive_calc_track(drv), NULL))
+        /* Set up the track for writing. */
+        if (image_setup_track(im, write->track, NULL))
             return TRUE;
 
         drv->writing = TRUE;
@@ -724,9 +767,8 @@ static bool_t dma_wr_handle(struct drive *drv)
         im->bufs.write_data.cons = 0;
         im->bufs.write_data.prod = 0;
 
-        /* Align the MFM consumer index for start of next write. */
-        write = get_write(im, im->wr_cons);
-        im->bufs.write_mfm.cons = (write->mfm_end + 31) & ~31;
+        /* Align the bitcell consumer index for start of next write. */
+        im->bufs.write_bc.cons = (write->bc_end + 31) & ~31;
 
         /* Sync back to mass storage. */
         F_sync(&im->fp);
@@ -755,30 +797,18 @@ void floppy_set_cyl(uint8_t unit, uint8_t cyl)
     }
 }
 
-void floppy_get_track(uint8_t *p_cyl, uint8_t *p_side, uint8_t *p_sel)
+void floppy_get_track(uint8_t *p_cyl, uint8_t *p_side, uint8_t *p_sel,
+                      uint8_t *p_writing)
 {
     *p_cyl = drive.cyl;
     *p_side = drive.head & (drive.nr_sides - 1);
     *p_sel = drive.sel;
+    *p_writing = (dma_wr && dma_wr->state != DMA_inactive);
 }
 
 bool_t floppy_handle(void)
 {
     struct drive *drv = &drive;
-
-    if (!drv->image) {
-        image_open(image, drv->slot);
-        drv->image = image;
-        dma_rd->state = DMA_stopping;
-        if ((drv->slot->attributes & AM_RDO)
-            || !image->handler->write_track) {
-            printk("Image is R/O %s%s\n",
-                   (drv->slot->attributes & AM_RDO) ? "[fat-attr]" : "",
-                   !image->handler->write_track ? "[no-handler]" : "");
-        } else {
-            drive_change_output(drv, outp_wrprot, FALSE);
-        }
-    }
 
     return ((dma_wr->state == DMA_inactive)
             ? dma_rd_handle : dma_wr_handle)(drv);
@@ -789,13 +819,12 @@ static void index_assert(void *dat)
     struct drive *drv = &drive;
     index.prev_time = index.timer.deadline;
     if (!drv->index_suppressed
-        && !(drv->step.state && !ff_cfg.index_during_seek)) {
+        && !(drv->step.state && ff_cfg.index_suppression)) {
         drive_change_output(drv, outp_index, TRUE);
-        timer_set(&index.timer_deassert, stk_add(index.prev_time, stk_ms(2)));
+        timer_set(&index.timer_deassert, index.prev_time + time_ms(2));
     }
     if (dma_rd->state != DMA_active) /* timer set from input flux stream */
-        timer_set(&index.timer, stk_add(index.prev_time,
-                                        stk_ms(DRIVE_MS_PER_REV)));
+        timer_set(&index.timer, index.prev_time + drv->image->stk_per_rev);
 }
 
 static void index_deassert(void *dat)
@@ -810,14 +839,15 @@ static void drive_step_timer(void *_drv)
 
     switch (drv->step.state) {
     case STEP_started:
-        /* nothing to do, IRQ_step() needs to reset our deadline */
+        /* nothing to do, IRQ_soft() needs to reset our deadline */
         break;
     case STEP_latched:
         speaker_pulse();
         if ((drv->cyl >= 84) && !drv->step.inward)
             drv->cyl = 84; /* Fast step back from D-A cyl 255 */
         drv->cyl += drv->step.inward ? 1 : -1;
-        timer_set(&drv->step.timer, stk_add(drv->step.start, DRIVE_SETTLE_MS));
+        timer_set(&drv->step.timer,
+                  drv->step.start + time_ms(DRIVE_SETTLE_MS));
         if (drv->cyl == 0)
             drive_change_output(drv, outp_trk0, TRUE);
         /* New state last, as that lets hi-pri IRQ start another step. */
@@ -831,14 +861,19 @@ static void drive_step_timer(void *_drv)
     }
 }
 
-static void IRQ_step(void)
+static void IRQ_soft(void)
 {
     struct drive *drv = &drive;
 
     if (drv->step.state == STEP_started) {
         timer_cancel(&drv->step.timer);
         drv->step.state = STEP_latched;
-        timer_set(&drv->step.timer, stk_add(drv->step.start, stk_ms(1)));
+        timer_set(&drv->step.timer, drv->step.start + time_ms(1));
+    }
+
+    if (index.fake_fired) {
+        index.fake_fired = FALSE;
+        timer_set(&index.timer_deassert, time_now() + time_us(500));
     }
 }
 
@@ -847,7 +882,7 @@ static void IRQ_rdata_dma(void)
     const uint16_t buf_mask = ARRAY_SIZE(dma_rd->buf) - 1;
     uint32_t prev_ticks_since_index, ticks, i;
     uint16_t nr_to_wrap, nr_to_cons, nr, dmacons, done;
-    stk_time_t now;
+    time_t now;
     struct drive *drv = &drive;
 
     /* Clear DMA peripheral interrupts. */
@@ -899,7 +934,7 @@ static void IRQ_rdata_dma(void)
     for (;;) {
         /* Snapshot current position in flux stream, including progress through
          * current timer sample. */
-        now = stk_now();
+        now = time_now();
         /* Ticks left in current sample. */
         ticks = tim_rdata->arr - tim_rdata->cnt;
         /* Index of next sample. */
@@ -916,8 +951,8 @@ static void IRQ_rdata_dma(void)
     /* Subtract current flux offset beyond the index. */
     ticks -= image_ticks_since_index(drv->image);
     /* Calculate deadline for index timer. */
-    ticks /= SYSCLK_MHZ/STK_MHZ;
-    timer_set(&index.timer, stk_add(now, ticks));
+    ticks /= SYSCLK_MHZ/TIME_MHZ;
+    timer_set(&index.timer, now + ticks);
 }
 
 static void IRQ_wdata_dma(void)
@@ -925,9 +960,9 @@ static void IRQ_wdata_dma(void)
     const uint16_t buf_mask = ARRAY_SIZE(dma_rd->buf) - 1;
     uint16_t cons, prod, prev, curr, next;
     uint16_t cell = image->write_bc_ticks, window;
-    uint32_t mfm = 0, mfmprod, syncword = image->handler->syncword;
-    uint32_t *mfmbuf = image->bufs.write_mfm.p;
-    unsigned int mfmbuflen = image->bufs.write_mfm.len / 4;
+    uint32_t bc_dat = 0, bc_prod, syncword = image->handler->syncword;
+    uint32_t *bc_buf = image->bufs.write_bc.p;
+    unsigned int bc_bufmask = (image->bufs.write_bc.len / 4) - 1;
     struct write *write = NULL;
 
     window = cell + (cell >> 1);
@@ -944,49 +979,50 @@ static void IRQ_wdata_dma(void)
 
     /* Check if we are processing the tail end of a write. */
     barrier(); /* interrogate peripheral /then/ check for write-end. */
-    if (image->wr_mfm != image->wr_prod) {
-        write = get_write(image, image->wr_mfm);
+    if (image->wr_bc != image->wr_prod) {
+        write = get_write(image, image->wr_bc);
         prod = write->dma_end;
     }
 
-    /* Process the flux timings into the MFM raw buffer. */
+    /* Process the flux timings into the raw bitcell buffer. */
     prev = dma_wr->prev_sample;
-    mfmprod = image->bufs.write_mfm.prod;
-    mfm = image->write_mfm_window;
+    bc_prod = image->bufs.write_bc.prod;
+    bc_dat = image->write_bc_window;
     for (cons = dma_wr->cons; cons != prod; cons = (cons+1) & buf_mask) {
         next = dma_wr->buf[cons];
         curr = next - prev;
         prev = next;
         while (curr > window) {
             curr -= cell;
-            mfm <<= 1;
-            mfmprod++;
-            if (!(mfmprod&31))
-                mfmbuf[((mfmprod-1) / 32) % mfmbuflen] = htobe32(mfm);
+            bc_dat <<= 1;
+            bc_prod++;
+            if (!(bc_prod&31))
+                bc_buf[((bc_prod-1) / 32) & bc_bufmask] = htobe32(bc_dat);
         }
-        mfm = (mfm << 1) | 1;
-        mfmprod++;
-        if (mfm == syncword)
-            mfmprod &= ~31;
-        if (!(mfmprod&31))
-            mfmbuf[((mfmprod-1) / 32) % mfmbuflen] = htobe32(mfm);
+        bc_dat = (bc_dat << 1) | 1;
+        bc_prod++;
+        if (bc_dat == syncword)
+            bc_prod &= ~31;
+        if (!(bc_prod&31))
+            bc_buf[((bc_prod-1) / 32) & bc_bufmask] = htobe32(bc_dat);
     }
+
+    if (bc_prod & 31)
+        bc_buf[(bc_prod / 32) & bc_bufmask] = htobe32(bc_dat << (-bc_prod&31));
 
     /* Processing the tail end of a write? */
     if (write != NULL) {
-        /* Remember where this write's MFM ends. */
-        write->mfm_end = mfmprod;
-        image->wr_mfm++;
+        /* Remember where this write's bitcell data ends. */
+        write->bc_end = bc_prod;
+        image->wr_bc++;
         /* Initialise decoder state for the start of the next write. */
-        mfmprod = (mfmprod + 31) & ~31;
-        mfm = prev = 0;
+        bc_prod = (bc_prod + 31) & ~31;
+        bc_dat = prev = 0;
     }
 
     /* Save our progress for next time. */
-    if (mfmprod & 31)
-        mfmbuf[(mfmprod / 32) % mfmbuflen] = htobe32(mfm << (-mfmprod&31));
-    image->write_mfm_window = mfm;
-    image->bufs.write_mfm.prod = mfmprod;
+    image->write_bc_window = bc_dat;
+    image->bufs.write_bc.prod = bc_prod;
     dma_wr->cons = cons;
     dma_wr->prev_sample = prev;
 }

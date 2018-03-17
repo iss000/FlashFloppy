@@ -68,6 +68,8 @@ enum {
     OP_skip = 12    /* +1byte: skip 0-8 bits in next byte */
 };
 
+static void hfe_seek_track(struct image *im, uint16_t track);
+
 static bool_t hfe_open(struct image *im)
 {
     struct disk_header dhdr;
@@ -87,22 +89,17 @@ static bool_t hfe_open(struct image *im)
     im->nr_cyls = dhdr.nr_tracks;
     im->nr_sides = dhdr.nr_sides;
     im->write_bc_ticks = sysclk_us(500) / le16toh(dhdr.bitrate);
+    im->ticks_per_cell = im->write_bc_ticks * 16;
+
+    /* Get an initial value for ticks per revolution. */
+    hfe_seek_track(im, 0);
 
     return TRUE;
 }
 
-static void hfe_seek_track(
-    struct image *im, uint16_t track, stk_time_t *start_pos)
+static void hfe_seek_track(struct image *im, uint16_t track)
 {
-    struct image_buf *rd = &im->bufs.read_data;
-    uint32_t sys_ticks = start_pos ? *start_pos : 0;
     struct track_header thdr;
-    uint8_t cyl = track/2, side = track&1;
-
-    /* TODO: Fake out unformatted tracks. */
-    cyl = min_t(uint8_t, cyl, im->nr_cyls-1);
-    side = min_t(uint8_t, side, im->nr_sides-1);
-    track = cyl*2 + side;
 
     F_lseek(&im->fp, im->hfe.tlut_base*512 + (track/2)*4);
     F_read(&im->fp, &thdr, sizeof(thdr), NULL);
@@ -110,36 +107,50 @@ static void hfe_seek_track(
     im->hfe.trk_off = le16toh(thdr.offset);
     im->hfe.trk_len = le16toh(thdr.len) / 2;
     im->tracklen_bc = im->hfe.trk_len * 8;
-    im->hfe.ticks_per_cell = ((sysclk_ms(DRIVE_MS_PER_REV) * 16u)
-                              / im->tracklen_bc);
-    im->ticks_since_flux = 0;
+    im->stk_per_rev = stk_sysclk(im->tracklen_bc * im->write_bc_ticks);
+
     im->cur_track = track;
+}
 
-    /* HFEv3: the track data length is not the same as track bit length as 
-     * it contains opcode metadata in the stream. Instead use a sensible 
-     * default (based on the kB/s bitrate in the image header) and expect this 
-     * to be updated via the opcode stream as necessary. */
-    if (im->hfe.is_v3)
-        im->hfe.ticks_per_cell = im->write_bc_ticks * 16;
+static void hfe_setup_track(
+    struct image *im, uint16_t track, uint32_t *start_pos)
+{
+    struct image_buf *rd = &im->bufs.read_data;
+    uint32_t sys_ticks;
+    uint8_t cyl = track/2, side = track&1;
 
-    im->cur_bc = (sys_ticks * 16) / im->hfe.ticks_per_cell;
+    /* TODO: Fake out unformatted tracks. */
+    cyl = min_t(uint8_t, cyl, im->nr_cyls-1);
+    side = min_t(uint8_t, side, im->nr_sides-1);
+    track = cyl*2 + side;
+
+    if (track != im->cur_track)
+        hfe_seek_track(im, track);
+
+    sys_ticks = start_pos ? *start_pos : get_write(im, im->wr_cons)->start;
+    im->cur_bc = (sys_ticks * 16) / im->ticks_per_cell;
     if (im->cur_bc >= im->tracklen_bc)
         im->cur_bc = 0;
-    im->cur_ticks = im->cur_bc * im->hfe.ticks_per_cell;
+    im->cur_ticks = im->cur_bc * im->ticks_per_cell;
+    im->ticks_since_flux = 0;
 
     sys_ticks = im->cur_ticks / 16;
 
-    im->hfe.trk_pos = (im->cur_bc/8) & ~255;
     rd->prod = rd->cons = 0;
 
     /* Aggressively batch our reads at HD data rate, as that can be faster 
      * than some USB drives will serve up a single block.*/
-    im->hfe.batch_secs = (im->hfe.ticks_per_cell > 1700) ? 2 : 8;
+    im->hfe.batch_secs = (im->write_bc_ticks > sysclk_ns(1500)) ? 2 : 8;
 
     if (start_pos) {
+        /* Read mode. */
+        im->hfe.trk_pos = (im->cur_bc/8) & ~255;
         image_read_track(im);
         rd->cons = im->cur_bc & 2047;
         *start_pos = sys_ticks;
+    } else {
+        /* Write mode. */
+        im->hfe.trk_pos = im->cur_bc / 8;
     }
 }
 
@@ -177,7 +188,7 @@ static uint16_t hfe_rdata_flux(struct image *im, uint16_t *tbuf, uint16_t nr)
 {
     struct image_buf *rd = &im->bufs.read_data;
     uint32_t ticks = im->ticks_since_flux;
-    uint32_t ticks_per_cell = im->hfe.ticks_per_cell;
+    uint32_t ticks_per_cell = im->ticks_per_cell;
     uint32_t y = 8, todo = nr;
     uint8_t x, *buf = rd->p;
     unsigned int buflen = (rd->len & ~255) - im->hfe.batch_secs*512;
@@ -206,7 +217,7 @@ static uint16_t hfe_rdata_flux(struct image *im, uint16_t *tbuf, uint16_t nr)
                 continue;
             case OP_bitrate:
                 x = _rbit32(buf[(rd->cons/8+1) % buflen]) >> 24;
-                im->hfe.ticks_per_cell = ticks_per_cell = 
+                im->ticks_per_cell = ticks_per_cell = 
                     (sysclk_us(2) * 16 * x) / 72;
                 rd->cons += 2*8;
                 im->cur_bc += 2*8;
@@ -252,25 +263,20 @@ static bool_t hfe_write_track(struct image *im)
 {
     bool_t flush;
     struct write *write = get_write(im, im->wr_cons);
-    struct image_buf *wr = &im->bufs.write_mfm;
+    struct image_buf *wr = &im->bufs.write_bc;
     uint8_t *buf = wr->p;
-    unsigned int buflen = wr->len;
+    unsigned int bufmask = wr->len - 1;
     uint8_t *w, *wrbuf = im->bufs.write_data.p;
-    uint32_t base = (write->start*(16/8)) / im->hfe.ticks_per_cell;
     uint32_t i, c = wr->cons / 8, p = wr->prod / 8;
-    stk_time_t t;
-
-    /* Even when we can buffer the whole track in memory, it still performs
-     * better to then write out sectors as they're dirtied. Otherwise we
-     * suffer 30ms+ of latency as the track buffer is written out. */
-    const bool_t write_whole_track = 0;
+    uint32_t batch = 0, batch_off = (im->hfe.trk_pos & ~255) << 1;
+    time_t t;
 
     /* If we are processing final data then use the end index, rounded to
      * nearest. */
     barrier();
-    flush = (im->wr_cons != im->wr_mfm);
+    flush = (im->wr_cons != im->wr_bc);
     if (flush)
-        p = (write->mfm_end + 4) / 8;
+        p = (write->bc_end + 4) / 8;
 
     if (!im->bufs.write_data.prod) {
         /* How many bytes is the full track data? */
@@ -280,21 +286,21 @@ static bool_t hfe_write_track(struct image *im)
             im->bufs.write_data.prod = 256;
         } else {
             /* Whole track fits in our buffer! Stream it in immediately. */
-            t = stk_now();
+            t = time_now();
             printk("Read whole track %u... ", im->cur_track);
             F_lseek(&im->fp, im->hfe.trk_off * 512);
             F_read(&im->fp, wrbuf, im->bufs.write_data.prod, NULL);
             F_lseek(&im->fp, im->hfe.trk_off * 512);
-            printk("%u us\n", stk_diff(t, stk_now()) / STK_MHZ);
+            printk("%u us\n", time_diff(t, time_now()) / TIME_MHZ);
         }
     }
 
     for (;;) {
 
-        uint32_t off = (c + base) % im->hfe.trk_len;
+        uint32_t off = im->hfe.trk_pos;
         UINT nr;
 
-        /* All bytes remaining in the MFM buffer. */
+        /* All bytes remaining in the raw-bitcell buffer. */
         nr = p - c;
         /* Limit to end of current 256-byte HFE block. */
         nr = min_t(UINT, nr, 256 - (off & 255));
@@ -310,17 +316,17 @@ static bool_t hfe_write_track(struct image *im)
             /* Encode into a 256-byte area in our staging buffer. */
             w = wrbuf;
             for (i = 0; i < nr; i++)
-                *w++ = _rbit32(buf[c++ % buflen]) >> 24;
+                *w++ = _rbit32(buf[c++ & bufmask]) >> 24;
 
             /* Write it back to mass storage straight away. */
-            t = stk_now();
+            t = time_now();
             printk("Write %u-%u (%u)... ", off, off+nr-1, nr);
             F_lseek(&im->fp,
                     im->hfe.trk_off * 512
                     + (im->cur_track & 1) * 256
                     + ((off & ~255) << 1) + (off & 255));
             F_write(&im->fp, wrbuf, nr, NULL);
-            printk("%u us\n", stk_diff(t, stk_now()) / STK_MHZ);
+            printk("%u us\n", time_diff(t, time_now()) / TIME_MHZ);
 
         } else {
 
@@ -329,35 +335,42 @@ static bool_t hfe_write_track(struct image *im)
                 + (im->cur_track & 1) * 256
                 + ((off & ~255) << 1) + (off & 255);
             for (i = 0; i < nr; i++)
-                *w++ = _rbit32(buf[c++ % buflen]) >> 24;
+                *w++ = _rbit32(buf[c++ & bufmask]) >> 24;
+            batch++;
 
-            if (!write_whole_track) {
-                w = wrbuf + ((off & ~255) << 1);
-                t = stk_now();
-                printk("Write %u-%u (%u)... ", off, off+nr-1, nr);
-                F_lseek(&im->fp, im->hfe.trk_off * 512 + ((off & ~255) << 1));
-                F_write(&im->fp, w, 512, NULL);
-                printk("%u us\n", stk_diff(t, stk_now()) / STK_MHZ);
+        }
+
+        im->hfe.trk_pos += nr;
+        if (im->hfe.trk_pos >= im->hfe.trk_len) {
+            ASSERT(im->hfe.trk_pos == im->hfe.trk_len);
+            im->hfe.trk_pos = 0;
+            if (batch) {
+                /* Process contiguous batch and ask to be called again for data
+                 * at start of track. */
+                flush = FALSE;
+                break;
             }
         }
     }
 
-    wr->cons = c * 8;
-
-    if (flush && write_whole_track) {
-        /* Whole track mode: flush dirty buffer in one go. */
-        t = stk_now();
-        printk("Write whole track %u... ", im->cur_track);
-        F_write(&im->fp, wrbuf, im->bufs.write_data.prod, NULL);
-        printk("%u us\n", stk_diff(t, stk_now()) / STK_MHZ);
+    if (batch) { 
+        unsigned int nr = batch * 512;
+        t = time_now();
+        printk("Write %u-%u (%u)... ", batch_off, batch_off+nr-1, nr);
+        w = wrbuf + batch_off;
+        F_lseek(&im->fp, im->hfe.trk_off * 512 + batch_off);
+        F_write(&im->fp, w, nr, NULL);
+        printk("%u us\n", time_diff(t, time_now()) / TIME_MHZ);
     }
+
+    wr->cons = c * 8;
 
     return flush;
 }
 
 const struct image_handler hfe_image_handler = {
     .open = hfe_open,
-    .seek_track = hfe_seek_track,
+    .setup_track = hfe_setup_track,
     .read_track = hfe_read_track,
     .rdata_flux = hfe_rdata_flux,
     .write_track = hfe_write_track,

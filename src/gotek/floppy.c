@@ -188,13 +188,19 @@ static void IRQ_STEP_changed(void)
         return;
 
     /* Valid step request for this drive: start the step operation. */
-    drv->step.start = stk_now();
+    drv->step.start = time_now();
     drv->step.state = STEP_started;
     if (drv->outp & m(outp_trk0))
         drive_change_output(drv, outp_trk0, FALSE);
-    if (dma_rd != NULL)
+    if (dma_rd != NULL) {
         rdata_stop();
-    IRQx_set_pending(STEP_IRQ);
+        if (!ff_cfg.index_suppression) {
+            /* Opportunistically insert an INDEX pulse ahead of seek op. */
+            drive_change_output(drv, outp_index, TRUE);
+            index.fake_fired = TRUE;
+        }
+    }
+    IRQx_set_pending(FLOPPY_SOFTIRQ);
 }
 
 static void IRQ_SIDE_changed(void)

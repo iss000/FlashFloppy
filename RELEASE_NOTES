@@ -3,6 +3,61 @@
 ** Keir Fraser <keir.xen@gmail.com>
 ************************************
 
+** v0.9.16a - 16 March 2018
+ - Support ADFS D/E/F images (suffix *.ADF, FF.CFG: host=acorn)
+ - Direct Access: Fix sector data CRCs
+ - Reliability improvements for Acorn systems (index-suppression=no)
+ - Rearrange floppy read/write buffering to avoid corruptions
+
+** v0.9.15a - 9 March 2018
+ - UI: Fix subfolder navigation when returning to parent folder (#66)
+ - OLED: Auto-detect OLED displays at I2C address 0x3d
+ - ST: Mimic TOS by applying track skew to ST image files (#44)
+ - 7-Seg LED: Allow write protection to be toggled as on LCD/OLED
+ - Support Ensoniq DD/HD custom IMG formats (host=ensoniq)
+ - Support IBM PC interface with density select (interface=ibmpc-hdout)
+ - Direct Access: Support track with fewer than 8 data sectors (#62)
+
+** v0.9.14a - 4 March 2018
+ - Fix write pipeline: record track number for delayed write processing
+ - General Music (GEM): New host option "host=gem" for direct IMG support
+ - Direct support for Spectrum Opus Discovery (OPD) image files
+ - HFE, ADF: Batch writeback to the USB drive where possible
+ - FF.CFG: Replace "index-during-seek" with "index-suppression"
+ - Direct Access: Restart read at correct track position after a write
+
+** v0.9.13a - 1 March 2018
+ - HFE: Emulate non-standard drive speeds (eg. Sony 600 RPM drive)
+ - HFE: Fix single-sector writes (broken since v0.9.8a)
+ - Direct Access: Support up to 64-sector track (Atari ST HxC Mount)
+ - Direct support for Spectrum TR-DOS (TRD) image files
+
+** v0.9.12a - 27 February 2018
+ - LCD/OLED: Long filenames scroll during navigation
+ - LCD/OLED: Make filename scrolling more configurable
+   - FF.CFG: {nav,display}-scroll-{rate,pause}
+ - Direct navigation: ".." returns to subfolder position within parent
+ - Fix head-seek settle time emulation
+ - ADF: Generate longer tracks, like a real Amiga would
+
+** v0.9.11a - 23 February 2018
+ - Fix Direct-Acesss mode (as used by HxC Autoboot, broken in v0.9.10a)
+
+** v0.9.10a - 22 February 2018
+ - New default OLED font 6x13 displays more text per line
+   - 7x16 font removed
+   - 8x16 font MAY be removed, let me know if you use it!!
+ - Narrow OLED view (default Gotek display cutout) supported
+   - FF.CFG: display-type = oled-128x32-narrow
+ - All images can be write-protected by default
+   - FF.CFG: write-protect = yes
+ - Write-protect switchable by holding eject for 2 seconds
+
+** v0.9.9a - 19 February 2018
+ - Fix write problems present in v0.9.8a (issue #53)
+ - Support rotary encoders with proper Gray code output
+   - FF.CFG: rotary = none | simple | gray
+
 ** v0.9.8a - 8 February 2018
  - Pipelined writes
    - New writes are buffered while older ones are written to the USB drive
