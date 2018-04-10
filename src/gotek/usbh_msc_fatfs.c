@@ -160,6 +160,11 @@ void usbh_msc_init(void)
               &USR_cb);
 }
 
+void usbh_msc_buffer_set(uint8_t *buf)
+{
+    Cfg_Rx_Buffer = buf;
+}
+
 void usbh_msc_process(void)
 {
     USBH_Process(&USB_OTG_Core, &USB_Host);
@@ -168,6 +173,11 @@ void usbh_msc_process(void)
 bool_t usbh_msc_connected(void)
 {
     return msc_device_connected && HCD_IsDeviceConnected(&USB_OTG_Core);
+}
+
+bool_t usbh_msc_readonly(void)
+{
+    return usbh_msc_connected() && USBH_MSC_Param.MSWriteProtect;
 }
 
 /*
@@ -179,9 +189,9 @@ DSTATUS disk_initialize(BYTE pdrv)
     if (pdrv)
         return RES_PARERR;
 
-    dstatus |= STA_NOINIT;
-    if (msc_device_connected && HCD_IsDeviceConnected(&USB_OTG_Core))
-        dstatus &= ~STA_NOINIT;
+    dstatus = (!usbh_msc_connected() ? STA_NOINIT
+               : USBH_MSC_Param.MSWriteProtect ? STA_PROTECT
+               : 0);
 
     return dstatus;
 }

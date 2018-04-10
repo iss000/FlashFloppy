@@ -33,6 +33,7 @@ struct img_image {
     uint32_t trk_off;
     uint16_t trk_sec;
     int32_t decode_pos;
+    uint8_t layout; /* LAYOUT_* */
     bool_t has_iam;
     uint8_t gap3, gap_4a;
     int8_t write_sector;
@@ -79,7 +80,6 @@ struct image_bufs {
 
 struct image {
     const struct image_handler *handler;
-    const struct image_handler *_handler;
 
     /* FatFS. */
     FIL fp;
@@ -108,6 +108,7 @@ struct image {
     uint32_t ticks_since_flux; /* Ticks since last flux sample/reversal */
     uint32_t write_bc_window; /* Sliding window at head of bitcell stream */
     uint32_t stk_per_rev; /* Nr STK ticks per revolution. */
+    enum { SYNC_none=0, SYNC_fm, SYNC_mfm } sync;
 
     union {
         struct adf_image adf;
@@ -130,7 +131,6 @@ struct image_handler {
     bool_t (*read_track)(struct image *im);
     uint16_t (*rdata_flux)(struct image *im, uint16_t *tbuf, uint16_t nr);
     bool_t (*write_track)(struct image *im);
-    uint32_t syncword;
 };
 
 /* Is given file valid to open as an image? */
@@ -170,7 +170,7 @@ uint8_t mfmtobin(uint16_t x);
 
 /* External API. */
 void floppy_init(uint8_t fintf_mode);
-void floppy_insert(unsigned int unit, const struct slot *slot);
+void floppy_insert(unsigned int unit, struct slot *slot);
 void floppy_cancel(void);
 bool_t floppy_handle(void); /* TRUE -> re-read config file */
 void floppy_set_cyl(uint8_t unit, uint8_t cyl);

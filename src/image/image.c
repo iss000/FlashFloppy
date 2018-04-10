@@ -18,6 +18,9 @@ extern const struct image_handler da_image_handler;
 extern const struct image_handler adfs_image_handler;
 extern const struct image_handler trd_image_handler;
 extern const struct image_handler opd_image_handler;
+extern const struct image_handler ssd_image_handler;
+extern const struct image_handler dsd_image_handler;
+extern const struct image_handler ti99_image_handler;
 
 bool_t image_valid(FILINFO *fp)
 {
@@ -39,7 +42,10 @@ bool_t image_valid(FILINFO *fp)
                || !strcmp(ext, "adl")
                || !strcmp(ext, "adm")
                || !strcmp(ext, "trd")
-               || !strcmp(ext, "opd")) {
+               || !strcmp(ext, "opd")
+               || !strcmp(ext, "ssd")
+               || !strcmp(ext, "dsd")
+               || !strcmp(ext, "v9t9")) {
         return TRUE;
     }
 
@@ -55,9 +61,12 @@ static bool_t try_handler(struct image *im, const struct slot *slot,
     /* Reinitialise image structure, except for static buffers. */
     memset(im, 0, sizeof(*im));
     im->bufs = bufs;
+    im->cur_track = ~0;
+
+    /* Sensible defaults. */
+    im->sync = SYNC_mfm;
     im->write_bc_ticks = sysclk_us(2);
     im->stk_per_rev = stk_ms(200);
-    im->cur_track = ~0;
 
     im->handler = handler;
 
@@ -100,6 +109,9 @@ void image_open(struct image *im, const struct slot *slot)
             : !strcmp(ext, "adm") ? &adfs_image_handler
             : !strcmp(ext, "trd") ? &trd_image_handler
             : !strcmp(ext, "opd") ? &opd_image_handler
+            : !strcmp(ext, "ssd") ? &ssd_image_handler
+            : !strcmp(ext, "dsd") ? &dsd_image_handler
+            : !strcmp(ext, "v9t9") ? &ti99_image_handler
             : NULL);
     if (hint) {
         if (try_handler(im, slot, hint))

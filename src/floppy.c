@@ -302,7 +302,7 @@ void floppy_init(uint8_t fintf_mode)
     timer_init(&index.timer_deassert, index_deassert, NULL);
 }
 
-void floppy_insert(unsigned int unit, const struct slot *slot)
+void floppy_insert(unsigned int unit, struct slot *slot)
 {
     struct drive *drv = &drive;
 
@@ -317,6 +317,9 @@ void floppy_insert(unsigned int unit, const struct slot *slot)
     /* Large buffer to absorb long write latencies at mass-storage layer. */
     image->bufs.write_bc.len = 16*1024; /* 16kB, power of two. */
     image->bufs.write_bc.p = arena_alloc(image->bufs.write_bc.len);
+
+    /* ~0 avoids sync match within fewer than 32 bits of scan start. */
+    image->write_bc_window = ~0;
 
     /* Smaller buffer for absorbing read latencies at mass-storage layer. */
     image->bufs.read_bc.len = 8*1024; /* 8kB, power of two. */
@@ -404,11 +407,10 @@ void floppy_insert(unsigned int unit, const struct slot *slot)
 
     /* Drive is ready. Set output signals appropriately. */
     drive_change_output(drv, outp_rdy, TRUE);
-    if ((slot->attributes & AM_RDO)
-        || !image->handler->write_track) {
-        printk("Image is R/O %s%s\n",
-               (slot->attributes & AM_RDO) ? "[fat-attr]" : "",
-               !image->handler->write_track ? "[no-handler]" : "");
+    if (!image->handler->write_track || usbh_msc_readonly())
+        slot->attributes |= AM_RDO;
+    if (slot->attributes & AM_RDO) {
+        printk("Image is R/O\n");
     } else {
         drive_change_output(drv, outp_wrprot, FALSE);
     }
@@ -684,7 +686,8 @@ static bool_t dma_rd_handle(struct drive *drv)
         /* Seek to the new track. */
         track = drive_calc_track(drv);
         read_start_pos *= SYSCLK_MHZ/STK_MHZ;
-        if ((track >= 510) && (drv->outp & m(outp_wrprot))) {
+        if ((track >= 510) && (drv->outp & m(outp_wrprot))
+            && !usbh_msc_readonly()) {
             /* Remove write-protect when driven into D-A mode. */
             drive_change_output(drv, outp_wrprot, FALSE);
         }
@@ -960,8 +963,9 @@ static void IRQ_wdata_dma(void)
     const uint16_t buf_mask = ARRAY_SIZE(dma_rd->buf) - 1;
     uint16_t cons, prod, prev, curr, next;
     uint16_t cell = image->write_bc_ticks, window;
-    uint32_t bc_dat = 0, bc_prod, syncword = image->handler->syncword;
+    uint32_t bc_dat = 0, bc_prod;
     uint32_t *bc_buf = image->bufs.write_bc.p;
+    unsigned int sync = image->sync;
     unsigned int bc_bufmask = (image->bufs.write_bc.len / 4) - 1;
     struct write *write = NULL;
 
@@ -1001,8 +1005,18 @@ static void IRQ_wdata_dma(void)
         }
         bc_dat = (bc_dat << 1) | 1;
         bc_prod++;
-        if (bc_dat == syncword)
-            bc_prod &= ~31;
+        switch (sync) {
+        case SYNC_fm:
+            /* FM clock sync clock byte is 0xc7. Check for:
+             * 1010 1010 1010 1010 1x1x 0x0x 0x1x 1x1x */
+            if ((bc_dat & 0xffffd555) == 0x55555015)
+                bc_prod = (bc_prod - 31) | 31;
+            break;
+        case SYNC_mfm:
+            if (bc_dat == 0x44894489)
+                bc_prod &= ~31;
+            break;
+        }
         if (!(bc_prod&31))
             bc_buf[((bc_prod-1) / 32) & bc_bufmask] = htobe32(bc_dat);
     }
@@ -1017,7 +1031,8 @@ static void IRQ_wdata_dma(void)
         image->wr_bc++;
         /* Initialise decoder state for the start of the next write. */
         bc_prod = (bc_prod + 31) & ~31;
-        bc_dat = prev = 0;
+        bc_dat = ~0;
+        prev = 0;
     }
 
     /* Save our progress for next time. */

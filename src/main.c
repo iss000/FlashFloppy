@@ -171,6 +171,9 @@ static void display_write_slot(bool_t nav_mode)
         : slot_type("adm") ? "ADM"
         : slot_type("trd") ? "TRD"
         : slot_type("opd") ? "OPD"
+        : slot_type("ssd") ? "SSD"
+        : slot_type("dsd") ? "DSD"
+        : slot_type("v9t9") ? "T99"
         : "UNK";
     snprintf(msg, sizeof(msg), "%03u/%03u%*s%s D:%u",
              cfg.slot_nr, cfg.max_slot_nr,
@@ -470,10 +473,11 @@ static void read_ff_cfg(void)
 
         case FFCFG_host:
             ff_cfg.host =
-                !strcmp(opts.arg, "akai") ? HOST_akai
-                : !strcmp(opts.arg, "acorn") ? HOST_acorn
+                !strcmp(opts.arg, "acorn") ? HOST_acorn
+                : !strcmp(opts.arg, "akai") ? HOST_akai
                 : !strcmp(opts.arg, "ensoniq") ? HOST_ensoniq
                 : !strcmp(opts.arg, "gem") ? HOST_gem
+                : !strcmp(opts.arg, "ti99") ? HOST_ti99
                 : HOST_unspecified;
             break;
 
@@ -1138,7 +1142,8 @@ static void cfg_update(uint8_t slot_mode)
         hxc_cfg_update(slot_mode);
     else
         native_update(slot_mode);
-    if (!(cfg.slot.attributes & AM_DIR) && ff_cfg.write_protect)
+    if (!(cfg.slot.attributes & AM_DIR)
+        && (ff_cfg.write_protect || usbh_msc_readonly()))
         cfg.slot.attributes |= AM_RDO;
 }
 
@@ -1378,6 +1383,10 @@ static int floppy_main(void *unused)
                 toggle_wp:
                     wait = 0;
                     cfg.slot.attributes ^= AM_RDO;
+                    if (usbh_msc_readonly()) {
+                        /* Read-only filesystem: force AM_RDO always. */
+                        cfg.slot.attributes |= AM_RDO;
+                    }
                     display_wp_status();
                     if (display_mode == DM_LED_7SEG)
                         led_7seg_write_string((cfg.slot.attributes & AM_RDO)
@@ -1651,10 +1660,13 @@ int main(void)
 
         banner();
 
+        arena_init();
+        usbh_msc_buffer_set(arena_alloc(512));
         while ((f_mount(&fatfs, "", 1) != FR_OK) && !cfg.usb_power_fault) {
             cfg_maybe_factory_reset();
             usbh_msc_process();
         }
+        usbh_msc_buffer_set((void *)0xdeadbeef);
 
         arena_init();
         fres = F_call_cancellable(floppy_main, NULL);
