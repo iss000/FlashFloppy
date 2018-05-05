@@ -1587,7 +1587,7 @@ static void banner(void)
 static void maybe_show_version(void)
 {
     uint8_t b, nb;
-    char *p, *np, msg[3];
+    char *p, *np, msg[32];
     int len;
 
     /* LCD/OLED already displays version info in idle state. */
