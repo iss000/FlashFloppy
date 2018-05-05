@@ -81,6 +81,11 @@ static bool_t dsk_open(struct image *im)
     im->nr_sides = dib->nr_sides;
     printk("DSK: %u cyls, %u sides\n", im->nr_cyls, im->nr_sides);
 
+    /* DSK data rate is fixed at 2us bitcell. Where the specified track layout 
+     * will not fit in regular 100k-bitcell track we simply extend the track 
+     * length and thus the period between index pulses. */
+    im->ticks_per_cell = im->write_bc_ticks * 16;
+
     return TRUE;
 }
 
@@ -99,9 +104,7 @@ static void dsk_seek_track(
         printk("T%u.%u: Unformatted\n", cyl, side);
         memset(tib, 0, sizeof(*tib));
         im->tracklen_bc = 100160;
-        im->ticks_per_cell = ((sysclk_stk(im->stk_per_rev) * 16u)
-                              / im->tracklen_bc);
-        return;
+        goto out;
     }
 
     im->dsk.trk_off = 0x100;
@@ -154,17 +157,15 @@ static void dsk_seek_track(
     tracklen *= 16;
 
     /* Calculate and round the track length. */
-    im->tracklen_bc = 100000;
-    if (im->tracklen_bc < tracklen)
-        im->tracklen_bc = tracklen + 1000;
+    im->tracklen_bc = max_t(unsigned int, 100000, tracklen + 20*16);
     im->tracklen_bc = (im->tracklen_bc + 31) & ~31;
-
-    /* Calculate output data rate (bitcell size). */
-    im->ticks_per_cell = ((sysclk_stk(im->stk_per_rev) * 16u)
-                          / im->tracklen_bc);
 
     /* Now calculate the pre-index track gap. */
     im->dsk.gap4 = (im->tracklen_bc - tracklen) / 16;
+
+out:
+    /* Calculate ticks per revolution */
+    im->stk_per_rev = stk_sysclk(im->tracklen_bc * im->write_bc_ticks);
 }
 
 static void dsk_setup_track(
@@ -242,7 +243,7 @@ static bool_t dsk_read_track(struct image *im)
     uint16_t *bc_b = bc->p;
     uint32_t bc_len, bc_mask, bc_space, bc_p, bc_c;
     uint16_t pr = 0, crc;
-    unsigned int i, buflen = rd->len & ~511;
+    unsigned int i;
 
     if (tib->nr_secs == 0) {
         /* Unformatted. */
@@ -254,10 +255,9 @@ static bool_t dsk_read_track(struct image *im)
         uint16_t off = 0;
         for (i = 0; i < im->dsk.trk_pos; i++)
             off += tib->sib[i].actual_length;
-        rd->cons = rd->prod = 0;
         F_lseek(&im->fp, im->dsk.trk_off + off);
         F_read(&im->fp, buf, tib->sib[i].actual_length, NULL);
-        rd->prod += tib->sib[i].actual_length * 8;
+        rd->prod++;
         if (++im->dsk.trk_pos >= tib->nr_secs)
             im->dsk.trk_pos = 0;
     }
@@ -322,7 +322,6 @@ static bool_t dsk_read_track(struct image *im)
         /* DAM */
         uint8_t sec = (im->dsk.decode_pos-2) >> 1;
         uint16_t sec_sz = tib->sib[sec].actual_length;
-        uint8_t *dat = &buf[(rd->cons/8)%buflen];
         uint8_t dam[4] = { 0xa1, 0xa1, 0xa1, 0xfb };
         if (bc_space < (GAP_SYNC + 4 + sec_sz + 2 + tib->gap3))
             return FALSE;
@@ -336,16 +335,16 @@ static bool_t dsk_read_track(struct image *im)
             emit_raw(0x4489);
         emit_byte(dam[3]);
         for (i = 0; i < sec_sz; i++)
-            emit_byte(dat[i]);
+            emit_byte(buf[i]);
         crc = crc16_ccitt(dam, sizeof(dam), 0xffff);
-        crc = crc16_ccitt(dat, sec_sz, crc);
+        crc = crc16_ccitt(buf, sec_sz, crc);
         if ((tib->sib[sec].stat1 & 0x20) && (tib->sib[sec].stat2 & 0x20))
             crc = ~crc; /* CRC Error in Data */
         emit_byte(crc >> 8);
         emit_byte(crc);
         for (i = 0; i < tib->gap3; i++)
             emit_byte(0x4e);
-        rd->cons += sec_sz * 8;
+        rd->cons++;
     }
 
     im->dsk.decode_pos++;

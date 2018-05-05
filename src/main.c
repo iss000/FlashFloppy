@@ -40,6 +40,10 @@ static struct {
     uint8_t ffcfg_has_display_scroll_rate:1;
 } cfg;
 
+/* If TRUE, reset to start of filename when selecting a new image. 
+ * If FALSE, try to maintain scroll offset when browsing through images. */
+#define cfg_scroll_reset TRUE
+
 uint8_t board_id;
 
 static uint32_t backlight_ticks;
@@ -146,7 +150,7 @@ static void display_write_slot(bool_t nav_mode)
             led_7seg_write_decimal(cfg.slot_nr);
         return;
     }
-    if (nav_mode) {
+    if (nav_mode && !cfg_scroll_reset) {
         lcd_scroll_init(0, ff_cfg.nav_scroll_rate);
         if (lcd_scroll.end == 0) {
             snprintf(msg, sizeof(msg), "%s", cfg.slot.name);
@@ -169,10 +173,12 @@ static void display_write_slot(bool_t nav_mode)
         : slot_type("st") ? "ST "
         : slot_type("adl") ? "ADL"
         : slot_type("adm") ? "ADM"
+        : slot_type("mgt") ? "MGT"
         : slot_type("trd") ? "TRD"
         : slot_type("opd") ? "OPD"
         : slot_type("ssd") ? "SSD"
         : slot_type("dsd") ? "DSD"
+        : slot_type("sdu") ? "SDU"
         : slot_type("v9t9") ? "T99"
         : "UNK";
     snprintf(msg, sizeof(msg), "%03u/%03u%*s%s D:%u",
@@ -465,9 +471,11 @@ static void read_ff_cfg(void)
 
         case FFCFG_interface:
             ff_cfg.interface =
-                !strcmp(opts.arg, "ibmpc") ? FINTF_IBMPC
+                !strcmp(opts.arg, "shugart") ? FINTF_SHUGART
+                : !strcmp(opts.arg, "ibmpc") ? FINTF_IBMPC
                 : !strcmp(opts.arg, "ibmpc-hdout") ? FINTF_IBMPC_HDOUT
-                : !strcmp(opts.arg, "shugart") ? FINTF_SHUGART
+                : !strcmp(opts.arg, "akai-s950") ? FINTF_AKAI_S950
+                : !strcmp(opts.arg, "amiga") ? FINTF_AMIGA
                 : FINTF_JC;
             break;
 
@@ -477,6 +485,7 @@ static void read_ff_cfg(void)
                 : !strcmp(opts.arg, "akai") ? HOST_akai
                 : !strcmp(opts.arg, "ensoniq") ? HOST_ensoniq
                 : !strcmp(opts.arg, "gem") ? HOST_gem
+                : !strcmp(opts.arg, "memotech") ? HOST_memotech
                 : !strcmp(opts.arg, "ti99") ? HOST_ti99
                 : HOST_unspecified;
             break;
@@ -1471,6 +1480,8 @@ static int floppy_main(void *unused)
 
             /* Wait a few seconds for further button presses before acting on 
              * the new image selection. */
+            if (cfg_scroll_reset)
+                lcd_scroll.off = lcd_scroll.end = 0;
             lcd_scroll_init(0, ff_cfg.nav_scroll_rate);
             lcd_scroll.ticks = time_ms(ff_cfg.nav_scroll_pause);
             wait_ms = (cfg.slot.attributes & AM_DIR) ?
@@ -1573,6 +1584,37 @@ static void banner(void)
     }
 }
 
+static void maybe_show_version(void)
+{
+    uint8_t b, nb;
+    char *p, *np, msg[3];
+    int len;
+
+    /* LCD/OLED already displays version info in idle state. */
+    if (display_mode != DM_LED_7SEG)
+        return;
+
+    /* Check if right button is pressed and released. */
+    if ((b = buttons) != B_RIGHT)
+        return;
+    while ((nb = buttons) == b)
+        continue;
+    if (nb)
+        return;
+
+    /* Iterate through the dotted sections of the version number. */
+    for (p = FW_VER; p != NULL; p = np ? np+1 : NULL) {
+        np = strchr(p, '.');
+        memset(msg, sizeof(msg), ' ');
+        len = min_t(int, np ? np - p : strnlen(p, sizeof(msg)), sizeof(msg));
+        memcpy(&msg[sizeof(msg) - len], p, len);
+        led_7seg_write_string(msg);
+        delay_ms(1000);
+    }
+
+    banner();
+}
+
 static void handle_errors(FRESULT fres)
 {
     char msg[17];
@@ -1663,6 +1705,7 @@ int main(void)
         arena_init();
         usbh_msc_buffer_set(arena_alloc(512));
         while ((f_mount(&fatfs, "", 1) != FR_OK) && !cfg.usb_power_fault) {
+            maybe_show_version();
             cfg_maybe_factory_reset();
             usbh_msc_process();
         }

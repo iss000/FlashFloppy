@@ -9,7 +9,7 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
-#define FW_VER "0.9.16a"
+#define FW_VER "0.9.19a"
 
 #ifndef NDEBUG
 #define ASSERT(p) do { if (!(p)) illegal(); } while (0)
@@ -73,6 +73,7 @@ int memcmp(const void *s1, const void *s2, size_t n);
 size_t strnlen(const char *s, size_t maxlen);
 int strcmp(const char *s1, const char *s2);
 int strncmp(const char *s1, const char *s2, size_t n);
+char *strchr(const char *s, int c);
 char *strrchr(const char *s, int c);
 int tolower(int c);
 int isspace(int c);

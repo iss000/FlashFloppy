@@ -3,17 +3,21 @@
 A retro floppy emulator for the ubiquitous Gotek hardware.
 - Directly supports a wide range of image formats:
   - ADF (Commodore Amiga)
-  - ADM, ADL, ADF (Acorn ADFS)
-  - DSK (Amstrad CPC, Spectrum +3)
-  - IMG/IMA (IBM MFM Raw Sector)
+  - ADM, ADL, ADF, DSD, SSD (Acorn DFS and ADFS)
+  - DSK (Amstrad CPC, Spectrum +3, Sam Coupe)
+  - IMG, IMA, DSK (IBM MFM Raw Sector)
+  - MGT (Spectrum DISCiPLE/+D)
   - OPD (Spectrum Opus Discovery)
+  - SDU (SAB Diskette Utility)
   - ST (Atari ST)
   - TRD (Spectrum TR-DOS)
+  - V9T9, DSK (TI-99/4A)
   - HFE, HFEv3 (Universal)
 - Pre-configured track layouts for Raw Sector Images:
   - Akai (S01, S20, S950)
   - Ensoniq (ASR, TS, etc)
   - General Music (S2, S3, S2R)
+  - Memotech
   - IBM PC and many others
 
 ## Download

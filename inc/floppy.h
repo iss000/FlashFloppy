@@ -14,11 +14,15 @@
 #define FINTF_SHUGART     0
 #define FINTF_IBMPC       1
 #define FINTF_IBMPC_HDOUT 2
+#define FINTF_AKAI_S950   3
+#define FINTF_AMIGA       4
 
 struct adf_image {
     uint32_t trk_off;
     uint16_t trk_pos, trk_len;
     int32_t decode_pos;
+    uint32_t pre_idx_gap_bc;
+    uint32_t nr_secs;
 };
 
 struct hfe_image {
@@ -27,10 +31,14 @@ struct hfe_image {
     uint16_t trk_pos, trk_len;
     bool_t is_v3;
     uint8_t batch_secs;
+    struct {
+        uint16_t off, len;
+        bool_t dirty;
+    } write_batch;
 };
 
 struct img_image {
-    uint32_t trk_off;
+    uint32_t trk_off, base_off;
     uint16_t trk_sec;
     int32_t decode_pos;
     uint8_t layout; /* LAYOUT_* */

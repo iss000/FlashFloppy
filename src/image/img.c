@@ -64,15 +64,23 @@ const static struct img_type {
     { 16, 1,  57, 1, 1, 0, 0, _C(40) }, /* ADFS S 160k */
     { 0 }
 }, akai_type[] = {
+    {  5, 2, 116, 1, 3, 1, 0, _C(80) }, /* Akai DD:  5 * 1kB sectors */
     { 10, 2, 116, 1, 3, 1, 0, _C(80) }, /* Akai HD: 10 * 1kB sectors */
     { 0 }
 }, ensoniq_type[] = {
-    {  9, 2, 84, 1, 2, 1, 0, _C(80) },  /* PC 720kB */
     { 10, 2, 30, 1, 2, 0, 0, _C(80) },  /* Ensoniq 800kB */
-    { 18, 2, 84, 1, 2, 1, 0, _C(80) },  /* PC 1.44MB */
     { 20, 2, 40, 1, 2, 0, 0, _C(80) },  /* Ensoniq 1.6MB */
     { 0 }
+}, memotech_type[] = {
+    { 16, 2, 57, 3, 1, 1, 0, _C(40) }, /* Type 03 */
+    { 16, 2, 57, 3, 1, 1, 0, _C(80) }, /* Type 07 */
 };
+
+static FSIZE_t im_size(struct image *im)
+{
+    return (f_size(&im->fp) < im->img.base_off) ? 0
+        : (f_size(&im->fp) - im->img.base_off);
+}
 
 static bool_t _img_open(struct image *im, bool_t has_iam,
                         const struct img_type *type)
@@ -97,7 +105,7 @@ static bool_t _img_open(struct image *im, bool_t has_iam,
             }
             cyl_sz = type->nr_secs * (128 << type->no) * type->nr_sides;
             for (nr_cyls = min_cyls; nr_cyls <= max_cyls; nr_cyls++)
-                if ((nr_cyls * cyl_sz) == f_size(&im->fp))
+                if ((nr_cyls * cyl_sz) == im_size(im))
                     goto found;
         }
 
@@ -129,6 +137,7 @@ static bool_t adfs_open(struct image *im)
 static bool_t img_open(struct image *im)
 {
     const struct img_type *type;
+
     switch (ff_cfg.host) {
     case HOST_akai:
     case HOST_gem:
@@ -137,13 +146,18 @@ static bool_t img_open(struct image *im)
     case HOST_ensoniq:
         type = ensoniq_type;
         break;
+    case HOST_memotech:
+        type = memotech_type;
+        break;
     case HOST_ti99:
         return ti99_open(im);
     default:
         type = img_type;
         break;
     }
-    return _img_open(im, TRUE, type);
+
+    /* Try specified host-specific geometries, falling back to default list. */
+    return _img_open(im, TRUE, type) || _img_open(im, TRUE, img_type);
 }
 
 static bool_t st_open(struct image *im)
@@ -154,6 +168,11 @@ static bool_t st_open(struct image *im)
         im->img.skew = 2;
     }
     return ok;
+}
+
+static bool_t mgt_open(struct image *im)
+{
+    return _img_open(im, TRUE, img_type);
 }
 
 static bool_t trd_open(struct image *im)
@@ -182,10 +201,10 @@ static bool_t trd_open(struct image *im)
         break;
     default:
         /* Guess geometry */
-        if (f_size(&im->fp) <= 40*16*256) {
+        if (im_size(im) <= 40*16*256) {
             im->nr_cyls = 40;
             im->nr_sides = 1;
-        } else if (f_size(&im->fp) < 40*2*16*256) {
+        } else if (im_size(im) < 40*2*16*256) {
             im->nr_cyls = 40;
             im->nr_sides = 1;
         } else {
@@ -206,7 +225,7 @@ static bool_t trd_open(struct image *im)
 
 static bool_t opd_open(struct image *im)
 {
-    switch (f_size(&im->fp)) {
+    switch (im_size(im)) {
     case 184320:
         im->nr_cyls = 40;
         im->nr_sides = 1;
@@ -256,6 +275,42 @@ static bool_t dsd_open(struct image *im)
     return fm_open(im);
 }
 
+static bool_t sdu_open(struct image *im)
+{
+    struct {
+        uint8_t app[21], ver[5];
+        uint16_t flags;
+        uint16_t type;
+        struct { uint16_t c, h, s; } max, used;
+        uint16_t sec_size, trk_size;
+    } header;
+
+    /* Read basic (cyls, heads, spt) geometry from the image header. */
+    F_read(&im->fp, &header, sizeof(header), NULL);
+    im->nr_cyls = le16toh(header.max.c);
+    im->nr_sides = le16toh(header.max.h);
+    im->img.nr_sectors = le16toh(header.max.s);
+
+    /* Check the geometry. Accept 180k/360k/720k/1.44M/2.88M PC sizes. */
+    if (((im->nr_cyls != 40) && (im->nr_cyls != 80))
+        || ((im->nr_sides != 1) && (im->nr_sides != 2))
+        || ((im->img.nr_sectors != 9)
+            && (im->img.nr_sectors != 18)
+            && (im->img.nr_sectors != 36)))
+        return FALSE;
+
+    /* Fill in the rest of the geometry. */
+    im->img.sec_no = 2; /* 512-byte sectors */
+    im->img.interleave = 1; /* no interleave */
+    im->img.sec_base = 1; /* standard numbering */
+    im->img.gap3 = 84; /* standard gap3 */
+
+    /* Skip 46-byte SABDU header. */
+    im->img.base_off = 46;
+
+    return _img_open(im, TRUE, NULL);
+}
+
 static bool_t ti99_open(struct image *im)
 {
     struct vib {
@@ -269,7 +324,7 @@ static bool_t ti99_open(struct image *im)
         uint8_t density;
     } vib;
     bool_t have_vib;
-    unsigned int fsize = f_size(&im->fp);
+    unsigned int fsize = im_size(im);
 
     /* Must be a multiple of 256 sectors. */
     if ((fsize % 256) != 0)
@@ -395,6 +450,14 @@ const struct image_handler adfs_image_handler = {
     .write_track = img_write_track,
 };
 
+const struct image_handler mgt_image_handler = {
+    .open = mgt_open,
+    .setup_track = img_setup_track,
+    .read_track = img_read_track,
+    .rdata_flux = bc_rdata_flux,
+    .write_track = img_write_track,
+};
+
 const struct image_handler trd_image_handler = {
     .open = trd_open,
     .setup_track = img_setup_track,
@@ -421,6 +484,14 @@ const struct image_handler ssd_image_handler = {
 
 const struct image_handler dsd_image_handler = {
     .open = dsd_open,
+    .setup_track = img_setup_track,
+    .read_track = img_read_track,
+    .rdata_flux = bc_rdata_flux,
+    .write_track = img_write_track,
+};
+
+const struct image_handler sdu_image_handler = {
+    .open = sdu_open,
     .setup_track = img_setup_track,
     .read_track = img_read_track,
     .rdata_flux = bc_rdata_flux,
@@ -466,6 +537,7 @@ static void img_seek_track(
         im->img.trk_off = trk * trk_len;
         break;
     }
+    im->img.trk_off += im->img.base_off;
 
     im->cur_track = track;
 }
@@ -605,13 +677,13 @@ static bool_t mfm_read_track(struct image *im)
     uint16_t *bc_b = bc->p;
     uint32_t bc_len, bc_mask, bc_space, bc_p, bc_c;
     uint16_t pr = 0, crc;
-    unsigned int i, buflen = rd->len & ~511;
+    unsigned int i;
 
     if (rd->prod == rd->cons) {
         uint8_t sec = im->img.sec_map[im->img.trk_sec] - im->img.sec_base;
         F_lseek(&im->fp, im->img.trk_off + sec * sec_sz(im));
-        F_read(&im->fp, &buf[(rd->prod/8) % buflen], sec_sz(im), NULL);
-        rd->prod += sec_sz(im) * 8;
+        F_read(&im->fp, buf, sec_sz(im), NULL);
+        rd->prod++;
         if (++im->img.trk_sec >= im->img.nr_sectors)
             im->img.trk_sec = 0;
     }
@@ -673,7 +745,6 @@ static bool_t mfm_read_track(struct image *im)
             emit_byte(0x4e);
     } else {
         /* DAM */
-        uint8_t *dat = &buf[(rd->cons/8)%buflen];
         uint8_t dam[4] = { 0xa1, 0xa1, 0xa1, 0xfb };
         if (bc_space < im->img.dam_sz)
             return FALSE;
@@ -683,14 +754,14 @@ static bool_t mfm_read_track(struct image *im)
             emit_raw(0x4489);
         emit_byte(dam[3]);
         for (i = 0; i < sec_sz(im); i++)
-            emit_byte(dat[i]);
+            emit_byte(buf[i]);
         crc = crc16_ccitt(dam, sizeof(dam), 0xffff);
-        crc = crc16_ccitt(dat, sec_sz(im), crc);
+        crc = crc16_ccitt(buf, sec_sz(im), crc);
         emit_byte(crc >> 8);
         emit_byte(crc);
         for (i = 0; i < im->img.gap3; i++)
             emit_byte(0x4e);
-        rd->cons += sec_sz(im) * 8;
+        rd->cons++;
     }
 
 #undef emit_raw
@@ -868,13 +939,13 @@ static bool_t fm_read_track(struct image *im)
     uint8_t *buf = rd->p;
     uint16_t crc, *bc_b = bc->p;
     uint32_t bc_len, bc_mask, bc_space, bc_p, bc_c;
-    unsigned int i, buflen = rd->len & ~511;
+    unsigned int i;
 
     if (rd->prod == rd->cons) {
         uint8_t sec = im->img.sec_map[im->img.trk_sec] - im->img.sec_base;
         F_lseek(&im->fp, im->img.trk_off + sec * sec_sz(im));
-        F_read(&im->fp, &buf[(rd->prod/8) % buflen], sec_sz(im), NULL);
-        rd->prod += sec_sz(im) * 8;
+        F_read(&im->fp, buf, sec_sz(im), NULL);
+        rd->prod++;
         if (++im->img.trk_sec >= im->img.nr_sectors)
             im->img.trk_sec = 0;
     }
@@ -924,7 +995,6 @@ static bool_t fm_read_track(struct image *im)
             emit_byte(0xff);
     } else {
         /* DAM */
-        uint8_t *dat = &buf[(rd->cons/8)%buflen];
         uint8_t dam[1] = { 0xfb };
         if (bc_space < im->img.dam_sz)
             return FALSE;
@@ -932,14 +1002,14 @@ static bool_t fm_read_track(struct image *im)
             emit_byte(0x00);
         emit_raw(fm_sync(dam[0], FM_SYNC_CLK));
         for (i = 0; i < sec_sz(im); i++)
-            emit_byte(dat[i]);
+            emit_byte(buf[i]);
         crc = crc16_ccitt(dam, sizeof(dam), 0xffff);
-        crc = crc16_ccitt(dat, sec_sz(im), crc);
+        crc = crc16_ccitt(buf, sec_sz(im), crc);
         emit_byte(crc >> 8);
         emit_byte(crc);
         for (i = 0; i < im->img.gap3; i++)
             emit_byte(0xff);
-        rd->cons += sec_sz(im) * 8;
+        rd->cons++;
     }
 
 #undef emit_raw
