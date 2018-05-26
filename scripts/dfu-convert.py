@@ -1,4 +1,5 @@
 # Written by Antonio Galea - 2010/11/18
+# Stripped down & modified by Keir Fraser for FlashFloppy project
 # Distributed under Gnu LGPL 3.0
 # see http://www.gnu.org/licenses/lgpl-3.0.txt
 
@@ -40,16 +41,10 @@ if __name__=="__main__":
   if options.hexfiles and len(args)==1:
     target = []
     
-    for hex in options.hexfiles:
-      ih = IntelHex(hex)
-      address = ih.minaddr()
-      data = ih.tobinstr()
-      try:
-        address = address & 0xFFFFFFFF
-      except ValueError:
-        print "Address %s invalid." % address
-        sys.exit(1)
-      target.append({ 'address': address, 'data': data })
+    for h in options.hexfiles:
+      ih = IntelHex(h)
+      for (s,e) in ih.segments():
+        target.append({ 'address': s, 'data': ih.tobinstr(s,e-1) })
     
     outfile = args[0]
     device = DEFAULT_DEVICE

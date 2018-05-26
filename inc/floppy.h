@@ -40,16 +40,18 @@ struct hfe_image {
 struct img_image {
     uint32_t trk_off, base_off;
     uint16_t trk_sec;
+    uint16_t rpm;
     int32_t decode_pos;
     uint8_t layout; /* LAYOUT_* */
     bool_t has_iam;
-    uint8_t gap3, gap_4a;
+    uint8_t gap_2, gap_3, gap_4a;
+    uint8_t post_crc_syncs;
     int8_t write_sector;
     uint8_t sec_base, sec_map[64];
     uint8_t nr_sectors, sec_no;
     uint8_t interleave:4, skew:4;
     bool_t skew_cyls_only;
-    uint16_t data_rate, gap4;
+    uint16_t data_rate, gap_4;
     uint32_t idx_sz, idam_sz, dam_sz;
 };
 

@@ -74,6 +74,15 @@ const static struct img_type {
 }, memotech_type[] = {
     { 16, 2, 57, 3, 1, 1, 0, _C(40) }, /* Type 03 */
     { 16, 2, 57, 3, 1, 1, 0, _C(80) }, /* Type 07 */
+    { 0 }
+}, pc98_type[] = {
+    { 8, 2, 116, 1, 3, 1, 0, _C(80) }, /* 360 rpm 1232 KB */
+    { 8, 2, 116, 1, 2, 1, 0, _C(80) }, /* 360 rpm 640 KB */
+    { 9, 2, 116, 1, 2, 1, 0, _C(80) }, /* 360 rpm 720 KB */
+    { 0 }
+}, uknc_type[] = {
+    { 10, 2, 38, 1, 2, 1, 0, _C(80) },
+    { 0 }
 };
 
 static FSIZE_t im_size(struct image *im)
@@ -119,7 +128,7 @@ static bool_t _img_open(struct image *im, bool_t has_iam,
         im->img.skew = type->skew;
         im->img.sec_base = type->base;
         im->img.nr_sectors = type->nr_secs;
-        im->img.gap3 = type->gap3;
+        im->img.gap_3 = type->gap3;
 
     }
 
@@ -151,13 +160,27 @@ static bool_t img_open(struct image *im)
         break;
     case HOST_ti99:
         return ti99_open(im);
+    case HOST_uknc:
+        im->img.gap_2 = 24;
+        im->img.gap_4a = 27;
+        im->img.post_crc_syncs = 1;
+        return _img_open(im, FALSE, uknc_type);
+    case HOST_pc98:
+        type = pc98_type;
+        im->img.rpm = 360;
+        break;
     default:
         type = img_type;
         break;
     }
 
-    /* Try specified host-specific geometries, falling back to default list. */
-    return _img_open(im, TRUE, type) || _img_open(im, TRUE, img_type);
+    /* Try specified host-specific geometries. */
+    if (_img_open(im, TRUE, type))
+        return TRUE;
+
+    /* Fall back to default list. */
+    memset(&im->img, 0, sizeof(im->img));
+    return _img_open(im, TRUE, img_type);
 }
 
 static bool_t st_open(struct image *im)
@@ -173,6 +196,42 @@ static bool_t st_open(struct image *im)
 static bool_t mgt_open(struct image *im)
 {
     return _img_open(im, TRUE, img_type);
+}
+
+static bool_t pc98fdi_open(struct image *im)
+{
+    struct {
+        uint32_t zero;
+        uint32_t density;
+        uint32_t header_size;
+        uint32_t image_body_size;
+        uint32_t sector_size_bytes;
+        uint32_t nr_secs;
+        uint32_t nr_sides;
+        uint32_t cyls;
+    } header;
+    F_read(&im->fp, &header, sizeof(header), NULL);
+    if (le32toh(header.density) == 0x30) {
+        im->img.rpm = 300;
+        im->img.gap_3 = 84;
+    } else {
+        im->img.rpm = 360;
+        im->img.gap_3 = 116;
+    }
+    if (le32toh(header.sector_size_bytes) == 512) {
+        im->img.sec_no = 2;
+    } else {
+        im->img.sec_no = 3;
+    }
+    im->nr_cyls = le32toh(header.cyls);
+    im->nr_sides = le32toh(header.nr_sides);
+    im->img.nr_sectors = le32toh(header.nr_secs);
+    im->img.interleave = 1;
+    im->img.sec_base = 1;
+    im->img.skew = 0;
+    /* Skip 4096-byte header. */
+    im->img.base_off = le32toh(header.header_size);
+    return _img_open(im, TRUE, NULL);
 }
 
 static bool_t trd_open(struct image *im)
@@ -218,7 +277,7 @@ static bool_t trd_open(struct image *im)
     im->img.skew = 0;
     im->img.sec_base = 1;
     im->img.nr_sectors = 16;
-    im->img.gap3 = 57;
+    im->img.gap_3 = 57;
 
     return _img_open(im, TRUE, NULL);
 }
@@ -244,7 +303,7 @@ static bool_t opd_open(struct image *im)
     im->img.skew_cyls_only = TRUE;
     im->img.sec_base = 0;
     im->img.nr_sectors = 18;
-    im->img.gap3 = 12;
+    im->img.gap_3 = 12;
 
     return _img_open(im, TRUE, NULL);
 }
@@ -257,7 +316,7 @@ static bool_t ssd_open(struct image *im)
     im->img.sec_no = 1; /* 256-byte */
     im->img.sec_base = 0;
     im->img.nr_sectors = 10;
-    im->img.gap3 = 21;
+    im->img.gap_3 = 21;
 
     return fm_open(im);
 }
@@ -270,7 +329,7 @@ static bool_t dsd_open(struct image *im)
     im->img.sec_no = 1; /* 256-byte */
     im->img.sec_base = 0;
     im->img.nr_sectors = 10;
-    im->img.gap3 = 21;
+    im->img.gap_3 = 21;
 
     return fm_open(im);
 }
@@ -303,7 +362,7 @@ static bool_t sdu_open(struct image *im)
     im->img.sec_no = 2; /* 512-byte sectors */
     im->img.interleave = 1; /* no interleave */
     im->img.sec_base = 1; /* standard numbering */
-    im->img.gap3 = 84; /* standard gap3 */
+    im->img.gap_3 = 84; /* standard gap3 */
 
     /* Skip 46-byte SABDU header. */
     im->img.base_off = 46;
@@ -359,7 +418,7 @@ static bool_t ti99_open(struct image *im)
             im->nr_cyls = 40;
             im->nr_sides = 1;
             im->img.nr_sectors = 9;
-            im->img.gap3 = 44;
+            im->img.gap_3 = 44;
             return fm_open(im);
         case 2: /* DSSD (or SSDD) */
             if (have_vib && (vib.sides == 1)) {
@@ -368,14 +427,14 @@ static bool_t ti99_open(struct image *im)
                 im->nr_sides = 1;
                 im->img.nr_sectors = 18;
                 im->img.interleave = 5;
-                im->img.gap3 = 24;
+                im->img.gap_3 = 24;
                 return mfm_open(im);
             }
             /* Assume DSSD. */
             im->nr_cyls = 40;
             im->nr_sides = 2;
             im->img.nr_sectors = 9;
-            im->img.gap3 = 44;
+            im->img.gap_3 = 44;
             return fm_open(im);
         case 4: /* DSDD (or DSSD80) */
             if (have_vib && (vib.tracks_per_side == 80)) {
@@ -383,7 +442,7 @@ static bool_t ti99_open(struct image *im)
                 im->nr_cyls = 80;
                 im->nr_sides = 2;
                 im->img.nr_sectors = 9;
-                im->img.gap3 = 44;
+                im->img.gap_3 = 44;
                 return fm_open(im);
             }
             /* Assume DSDD. */
@@ -391,21 +450,21 @@ static bool_t ti99_open(struct image *im)
             im->nr_sides = 2;
             im->img.nr_sectors = 18;
             im->img.interleave = 5;
-            im->img.gap3 = 24;
+            im->img.gap_3 = 24;
             return mfm_open(im);
         case 8: /* DSDD80 */
             im->nr_cyls = 80;
             im->nr_sides = 2;
             im->img.nr_sectors = 18;
             im->img.interleave = 5;
-            im->img.gap3 = 24;
+            im->img.gap_3 = 24;
             return mfm_open(im);
         case 16: /* DSHD80 */
             im->nr_cyls = 80;
             im->nr_sides = 2;
             im->img.nr_sectors = 36;
             im->img.interleave = 5;
-            im->img.gap3 = 24;
+            im->img.gap_3 = 24;
             return mfm_open(im);
         }
 
@@ -417,7 +476,7 @@ static bool_t ti99_open(struct image *im)
             im->nr_cyls = 40;
             im->img.nr_sectors = 16;
             im->img.interleave = 5;
-            im->img.gap3 = 44;
+            im->img.gap_3 = 44;
             return mfm_open(im);
         }
 
@@ -452,6 +511,14 @@ const struct image_handler adfs_image_handler = {
 
 const struct image_handler mgt_image_handler = {
     .open = mgt_open,
+    .setup_track = img_setup_track,
+    .read_track = img_read_track,
+    .rdata_flux = bc_rdata_flux,
+    .write_track = img_write_track,
+};
+
+const struct image_handler pc98fdi_image_handler = {
+    .open = pc98fdi_open,
     .setup_track = img_setup_track,
     .read_track = img_read_track,
     .rdata_flux = bc_rdata_flux,
@@ -609,6 +676,17 @@ static bool_t img_write_track(struct image *im)
     return (im->sync == SYNC_fm) ? fm_write_track(im) : mfm_write_track(im);
 }
 
+static void img_dump_info(struct image *im)
+{
+    printk("%s RAW IMG:\n", (im->sync == SYNC_fm) ? "FM" : "MFM");
+    printk(" rpm: %u, tracklen: %u, datarate: %u\n",
+           im->img.rpm, im->tracklen_bc, im->img.data_rate);
+    printk(" gap2: %u, gap3: %u, gap4a: %u, gap4: %u\n",
+           im->img.gap_2, im->img.gap_3, im->img.gap_4a, im->img.gap_4);
+    printk(" ticks_per_cell: %u, write_bc_ticks: %u\n",
+           im->ticks_per_cell, im->write_bc_ticks);
+}
+
 
 /*
  * MFM-Specific Handlers
@@ -620,17 +698,27 @@ static bool_t img_write_track(struct image *im)
 #define GAP_SYNC 12
 
 /* Shrink the IDAM pre-sync gap if sectors are close together. */
-#define idam_gap_sync(im) min_t(uint8_t, (im)->img.gap3, GAP_SYNC)
+#define idam_gap_sync(im) min_t(uint8_t, (im)->img.gap_3, GAP_SYNC)
 
 static bool_t mfm_open(struct image *im)
 {
     uint32_t tracklen;
+    unsigned int i;
 
-    im->img.idx_sz = im->img.gap_4a = GAP_4A;
+    im->img.rpm = im->img.rpm ?: 300;
+    im->img.gap_2 = im->img.gap_2 ?: GAP_2;
+    im->img.gap_4a = im->img.gap_4a ?: GAP_4A;
+
+    im->stk_per_rev = (stk_ms(200) * 300) / im->img.rpm;
+
+    im->img.idx_sz = im->img.gap_4a;
     if (im->img.has_iam)
         im->img.idx_sz += GAP_SYNC + 4 + GAP_1;
-    im->img.idam_sz = idam_gap_sync(im) + 8 + 2 + GAP_2;
-    im->img.dam_sz = GAP_SYNC + 4 + sec_sz(im) + 2 + im->img.gap3;
+    im->img.idam_sz = idam_gap_sync(im) + 8 + 2 + im->img.gap_2;
+    im->img.dam_sz = GAP_SYNC + 4 + sec_sz(im) + 2 + im->img.gap_3;
+
+    im->img.idam_sz += im->img.post_crc_syncs;
+    im->img.dam_sz += im->img.post_crc_syncs;
 
     /* Work out minimum track length (with no pre-index track gap). */
     tracklen = (im->img.idam_sz + im->img.dam_sz) * im->img.nr_sectors;
@@ -638,11 +726,13 @@ static bool_t mfm_open(struct image *im)
     tracklen *= 16;
 
     /* Infer the data rate and hence the standard track length. */
-    im->img.data_rate = (tracklen < 55000) ? 250 /* SD */
-        : (tracklen < 105000) ? 500 /* DD */
-        : (tracklen < 205000) ? 1000 /* HD */
-        : 2000; /* ED */
-    im->tracklen_bc = im->img.data_rate * 200;
+    for (i = 0; i < 3; i++) { /* SD=0, DD=1, HD=2, ED=3 */
+        uint32_t maxlen = (((50000u * 300) / im->img.rpm) << i) + 5000;
+        if (tracklen < maxlen)
+            break;
+    }
+    im->img.data_rate = 250u << i; /* SD=250, DD=500, HD=1000, ED=2000 */
+    im->tracklen_bc = (im->img.data_rate * 200 * 300) / im->img.rpm;
 
     /* Does the track data fit within standard track length? */
     if (im->tracklen_bc < tracklen) {
@@ -662,9 +752,13 @@ static bool_t mfm_open(struct image *im)
 
     im->ticks_per_cell = ((sysclk_stk(im->stk_per_rev) * 16u)
                           / im->tracklen_bc);
-    im->img.gap4 = (im->tracklen_bc - tracklen) / 16;
+    im->img.gap_4 = (im->tracklen_bc - tracklen) / 16;
 
     im->write_bc_ticks = sysclk_ms(1) / im->img.data_rate;
+
+    im->sync = SYNC_mfm;
+
+    img_dump_info(im);
 
     return TRUE;
 }
@@ -719,9 +813,9 @@ static bool_t mfm_read_track(struct image *im)
         }
     } else if (im->img.decode_pos == (im->img.nr_sectors * 2 + 1)) {
         /* Pre-index track gap */
-        if (bc_space < im->img.gap4)
+        if (bc_space < im->img.gap_4)
             return FALSE;
-        for (i = 0; i < im->img.gap4; i++)
+        for (i = 0; i < im->img.gap_4; i++)
             emit_byte(0x4e);
         im->img.decode_pos = (im->img.idx_sz != 0) ? -1 : 0;
     } else if (im->img.decode_pos & 1) {
@@ -741,7 +835,9 @@ static bool_t mfm_read_track(struct image *im)
         crc = crc16_ccitt(idam, sizeof(idam), 0xffff);
         emit_byte(crc >> 8);
         emit_byte(crc);
-        for (i = 0; i < GAP_2; i++)
+        for (i = 0; i < im->img.post_crc_syncs; i++)
+            emit_raw(0x4489);
+        for (i = 0; i < im->img.gap_2; i++)
             emit_byte(0x4e);
     } else {
         /* DAM */
@@ -759,7 +855,9 @@ static bool_t mfm_read_track(struct image *im)
         crc = crc16_ccitt(buf, sec_sz(im), crc);
         emit_byte(crc >> 8);
         emit_byte(crc);
-        for (i = 0; i < im->img.gap3; i++)
+        for (i = 0; i < im->img.post_crc_syncs; i++)
+            emit_raw(0x4489);
+        for (i = 0; i < im->img.gap_3; i++)
             emit_byte(0x4e);
         rd->cons++;
     }
@@ -896,18 +994,24 @@ static bool_t fm_open(struct image *im)
 {
     uint32_t tracklen;
 
-    im->img.idx_sz = im->img.gap_4a = FM_GAP_4A;
-    im->img.idam_sz = FM_GAP_SYNC + 5 + 2 + FM_GAP_2;
-    im->img.dam_sz = FM_GAP_SYNC + 1 + sec_sz(im) + 2 + im->img.gap3;
+    im->img.rpm = im->img.rpm ?: 300;
+    im->img.gap_2 = im->img.gap_2 ?: FM_GAP_2;
+    im->img.gap_4a = im->img.gap_4a ?: FM_GAP_4A;
+
+    im->stk_per_rev = (stk_ms(200) * 300) / im->img.rpm;
+
+    im->img.idx_sz = im->img.gap_4a;
+    im->img.idam_sz = FM_GAP_SYNC + 5 + 2 + im->img.gap_2;
+    im->img.dam_sz = FM_GAP_SYNC + 1 + sec_sz(im) + 2 + im->img.gap_3;
 
     /* Work out minimum track length (with no pre-index track gap). */
     tracklen = (im->img.idam_sz + im->img.dam_sz) * im->img.nr_sectors;
     tracklen += im->img.idx_sz;
     tracklen *= 16;
 
-    /* Infer the data rate and hence the standard track length. */
+    /* Data rate is always SD. */
     im->img.data_rate = 250; /* SD */
-    im->tracklen_bc = im->img.data_rate * 200;
+    im->tracklen_bc = (im->img.data_rate * 200 * 300) / im->img.rpm;
 
     ASSERT(im->tracklen_bc > tracklen);
 
@@ -916,11 +1020,13 @@ static bool_t fm_open(struct image *im)
 
     im->ticks_per_cell = ((sysclk_stk(im->stk_per_rev) * 16u)
                           / im->tracklen_bc);
-    im->img.gap4 = (im->tracklen_bc - tracklen) / 16;
+    im->img.gap_4 = (im->tracklen_bc - tracklen) / 16;
 
     im->write_bc_ticks = sysclk_ms(1) / im->img.data_rate;
 
     im->sync = SYNC_fm;
+
+    img_dump_info(im);
 
     return TRUE;
 }
@@ -971,9 +1077,9 @@ static bool_t fm_read_track(struct image *im)
         ASSERT(!im->img.has_iam);
     } else if (im->img.decode_pos == (im->img.nr_sectors * 2 + 1)) {
         /* Pre-index track gap */
-        if (bc_space < im->img.gap4)
+        if (bc_space < im->img.gap_4)
             return FALSE;
-        for (i = 0; i < im->img.gap4; i++)
+        for (i = 0; i < im->img.gap_4; i++)
             emit_byte(0xff);
         im->img.decode_pos = (im->img.idx_sz != 0) ? -1 : 0;
     } else if (im->img.decode_pos & 1) {
@@ -991,7 +1097,7 @@ static bool_t fm_read_track(struct image *im)
         crc = crc16_ccitt(idam, sizeof(idam), 0xffff);
         emit_byte(crc >> 8);
         emit_byte(crc);
-        for (i = 0; i < FM_GAP_2; i++)
+        for (i = 0; i < im->img.gap_2; i++)
             emit_byte(0xff);
     } else {
         /* DAM */
@@ -1007,7 +1113,7 @@ static bool_t fm_read_track(struct image *im)
         crc = crc16_ccitt(buf, sec_sz(im), crc);
         emit_byte(crc >> 8);
         emit_byte(crc);
-        for (i = 0; i < im->img.gap3; i++)
+        for (i = 0; i < im->img.gap_3; i++)
             emit_byte(0xff);
         rd->cons++;
     }
