@@ -1,0 +1,13 @@
+https://github.com/keirf/FlashFloppy
+
+prerequisites:
+  git
+  gcc-arm-none-eabi
+  srecord
+  stm32flash
+  python-crcmod
+ +pip install IntelHex 
+
+# git clone https://github.com/keirf/FlashFloppy.git
+# cd FlashFloppy
+# make dist
