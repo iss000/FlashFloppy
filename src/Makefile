@@ -2,7 +2,6 @@ OBJS += arena.o
 OBJS += cancellation.o
 OBJS += config.o
 OBJS += crc.o
-OBJS += display.o
 OBJS += flash_cfg.o
 OBJS += vectors.o
 OBJS += floppy.o
@@ -18,15 +17,16 @@ OBJS += util.o
 
 OBJS-$(debug) += console.o
 
+SUBDIRS += display
 SUBDIRS += fatfs
 SUBDIRS += image
-SUBDIRS-$(gotek) += gotek
-SUBDIRS-$(touch) += touch
+SUBDIRS += gotek
+SUBDIRS += usb
 
 flash_cfg.o: ff_cfg_defaults.h
 
-ff_cfg_defaults.h: ../examples/FF.CFG
-	python ../scripts/mk_config.py $< $@
+ff_cfg_defaults.h: $(ROOT)/examples/FF.CFG
+	$(PYTHON) $(ROOT)/scripts/mk_config.py $< $@
 
 clean::
 	rm -f ff_cfg_defaults.h

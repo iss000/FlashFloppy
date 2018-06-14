@@ -1,26 +1,18 @@
 
 PROJ = FlashFloppy
-VER = v0.9.19a
-PYTHON = python2
+VER = v0.9.21a
 
 SUBDIRS += src bootloader reloader
 
-.PHONY: all clean flash start serial gotek touch
+.PHONY: all clean flash start serial gotek
 
 ifneq ($(RULES_MK),y)
+
+.DEFAULT_GOAL := gotek
 export ROOT := $(CURDIR)
+
 all:
-	$(MAKE) -C src -f $(ROOT)/Rules.mk $(PROJ).elf $(PROJ).bin $(PROJ).hex
-	bootloader=y $(MAKE) -C bootloader -f $(ROOT)/Rules.mk \
-		Bootloader.elf Bootloader.bin Bootloader.hex
-	reloader=y $(MAKE) -C reloader -f $(ROOT)/Rules.mk \
-		Reloader.elf Reloader.bin Reloader.hex
-	srec_cat bootloader/Bootloader.hex -Intel src/$(PROJ).hex -Intel \
-	-o FF.hex -Intel
-	$(PYTHON) ./scripts/mk_update.py src/$(PROJ).bin FF.upd
-	$(PYTHON) ./scripts/mk_update.py bootloader/Bootloader.bin BL.rld
-	$(PYTHON) ./scripts/mk_update.py reloader/Reloader.bin RL.upd
-	$(PYTHON) ./scripts/dfu-convert.py -i FF.hex FF.dfu
+	$(MAKE) -f $(ROOT)/Rules.mk all
 
 clean:
 	rm -f *.hex *.upd *.rld *.dfu *.html
@@ -34,12 +26,9 @@ gotek: all
 	mv BL.rld FF_Gotek-Bootloader-$(VER).rld
 	mv RL.upd FF_Gotek-Reloader-$(VER).upd
 
-touch: export touch=y
-touch: all
-
 HXC_FF_URL := https://www.github.com/keirf/HxC_FF_File_Selector
 HXC_FF_URL := $(HXC_FF_URL)/releases/download
-HXC_FF_VER := v1.70-ff
+HXC_FF_VER := v1.71-ff
 
 dist:
 	rm -rf flashfloppy_*
@@ -66,6 +55,21 @@ dist:
 mrproper: clean
 	rm -rf flashfloppy_*
 	rm -rf HxC_Compat_Mode-$(HXC_FF_VER).zip
+
+else
+
+all:
+	$(MAKE) -C src -f $(ROOT)/Rules.mk $(PROJ).elf $(PROJ).bin $(PROJ).hex
+	bootloader=y $(MAKE) -C bootloader -f $(ROOT)/Rules.mk \
+		Bootloader.elf Bootloader.bin Bootloader.hex
+	reloader=y $(MAKE) -C reloader -f $(ROOT)/Rules.mk \
+		Reloader.elf Reloader.bin Reloader.hex
+	srec_cat bootloader/Bootloader.hex -Intel src/$(PROJ).hex -Intel \
+	-o FF.hex -Intel
+	$(PYTHON) ./scripts/mk_update.py src/$(PROJ).bin FF.upd
+	$(PYTHON) ./scripts/mk_update.py bootloader/Bootloader.bin BL.rld
+	$(PYTHON) ./scripts/mk_update.py reloader/Reloader.bin RL.upd
+	$(PYTHON) ./scripts/dfu-convert.py -i FF.hex FF.dfu
 
 endif
 

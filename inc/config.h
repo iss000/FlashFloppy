@@ -52,9 +52,10 @@ struct __packed ff_cfg {
 #define IMGS_init   2
     uint8_t image_on_startup;
     uint16_t display_probe_ms;
-#define TWOBUTTON_zero   0
-#define TWOBUTTON_eject  1
-#define TWOBUTTON_rotary 2
+#define TWOBUTTON_zero        0
+#define TWOBUTTON_eject       1
+#define TWOBUTTON_rotary      2
+#define TWOBUTTON_rotary_fast 3
     uint8_t twobutton_action;
 #define NAVMODE_default 0
 #define NAVMODE_indexed 1
@@ -72,6 +73,8 @@ struct __packed ff_cfg {
 #define HOST_memotech    6
 #define HOST_uknc        7
 #define HOST_pc98        8
+#define HOST_pc_dos      9
+#define HOST_msx        10
     uint8_t host;
     /* Bitfields within display_type field. */
 #define DISPLAY_lcd    (1<<0)
@@ -86,15 +89,17 @@ struct __packed ff_cfg {
 #define DISPLAY_oled_128x32_narrow (DISPLAY_oled | DISPLAY_narrow)
     uint8_t display_type;
     bool_t _unused0;
-#define ROT_none   0
-#define ROT_simple 1
-#define ROT_gray   2
+#define ROT_none    0
+#define ROT_full    1
+#define ROT_half    3
+#define ROT_quarter 2
     uint8_t rotary;
     bool_t write_protect;
     uint16_t nav_scroll_rate;
     uint16_t nav_scroll_pause;
     uint16_t display_scroll_pause;
     bool_t index_suppression;
+    bool_t extend_image;
 };
 
 extern struct ff_cfg ff_cfg;

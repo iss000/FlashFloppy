@@ -108,11 +108,7 @@ struct exti_irq {
     uint16_t pr_mask; /* != 0: irq- and exti-pending flags are cleared */
 };
 
-#if BUILD_TOUCH
-#include "touch/floppy.c"
-#elif BUILD_GOTEK
 #include "gotek/floppy.c"
-#endif
 
 #define pin_unset 17
 const static uint8_t *fintf, fintfs[][outp_nr] = {
@@ -385,8 +381,22 @@ void floppy_insert(unsigned int unit, struct slot *slot)
     /* Minimum allowable buffer space (assumed by hfe image handler). */
     ASSERT(image->bufs.read_data.len >= 20*1024);
 
+    /* Mount the image file. */
     image_open(image, slot);
     drv->image = image;
+    if (!image->handler->write_track || usbh_msc_readonly())
+        slot->attributes |= AM_RDO;
+    if (slot->attributes & AM_RDO) {
+        printk("Image is R/O\n");
+    } else {
+        image_extend(image);
+    }
+
+    /* After image is extended at mount time, we permit no further changes 
+     * to the file metadata. Clear the dirent info to ensure this. */
+    image->fp.dir_ptr = NULL;
+    image->fp.dir_sect = 0;
+
     dma_rd->state = DMA_stopping;
 
     if (image->write_bc_ticks < sysclk_ns(1500))
@@ -461,13 +471,8 @@ void floppy_insert(unsigned int unit, struct slot *slot)
     /* Drive is ready. Set output signals appropriately. */
     drive_change_output(drv, outp_rdy, TRUE);
     update_amiga_id(image->stk_per_rev > stk_ms(300));
-    if (!image->handler->write_track || usbh_msc_readonly())
-        slot->attributes |= AM_RDO;
-    if (slot->attributes & AM_RDO) {
-        printk("Image is R/O\n");
-    } else {
+    if (!(slot->attributes & AM_RDO))
         drive_change_output(drv, outp_wrprot, FALSE);
-    }
 }
 
 static unsigned int drive_calc_track(struct drive *drv)

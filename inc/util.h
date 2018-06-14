@@ -9,7 +9,7 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
-#define FW_VER "0.9.19a"
+#define FW_VER "0.9.21a"
 
 #ifndef NDEBUG
 #define ASSERT(p) do { if (!(p)) illegal(); } while (0)
@@ -55,6 +55,7 @@ struct slot {
     uint8_t attributes;
     uint32_t firstCluster;
     uint32_t size;
+    uint32_t dir_sect, dir_ptr;
 };
 void fatfs_from_slot(FIL *file, const struct slot *slot, BYTE mode);
 
@@ -141,16 +142,14 @@ extern uint8_t display_mode;
 void speaker_init(void);
 void speaker_pulse(void);
 
-#ifdef BUILD_GOTEK
-
-/* Gotek: 3-digit 7-segment display */
+/* Display: 3-digit 7-segment display */
 void led_7seg_init(void);
 void led_7seg_write_string(const char *p);
 void led_7seg_write_decimal(unsigned int val);
 void led_7seg_display_setting(bool_t enable);
 int led_7seg_nr_digits(void);
 
-/* Gotek: I2C 16x2 LCD */
+/* Display: I2C 16x2 LCD */
 bool_t lcd_init(void);
 void lcd_clear(void);
 void lcd_write(int col, int row, int min, const char *str);
@@ -158,40 +157,14 @@ void lcd_backlight(bool_t on);
 void lcd_sync(void);
 extern uint8_t lcd_columns, lcd_rows;
 
-/* Gotek: USB stack processing */
+/* USB stack processing */
 void usbh_msc_init(void);
 void usbh_msc_buffer_set(uint8_t *buf);
 void usbh_msc_process(void);
 bool_t usbh_msc_connected(void);
 bool_t usbh_msc_readonly(void);
 
-#else /* !BUILD_GOTEK */
-
-static inline void led_7seg_init(void) {}
-static inline void led_7seg_write_string(const char *p) {}
-static inline void led_7seg_write_decimal(unsigned int val) {}
-static inline void led_7seg_display_setting(bool_t enable) {}
-static inline int led_7seg_nr_digits(void) { return 0; }
-
-static inline bool_t lcd_init(void) { return FALSE; }
-static inline void lcd_clear(void) {}
-static inline void lcd_write(int col, int row, int min, const char *str) {}
-static inline void lcd_backlight(bool_t on) {};
-static inline void lcd_sync(void) {}
-
-static inline void usbh_msc_init(void) {}
-static inline void usbh_msc_buffer_set(uint8_t *buf) {}
-static inline void usbh_msc_process(void) {}
-static inline bool_t usbh_msc_connected(void) { return FALSE; }
-
-#endif /* !BUILD_GOTEK */
-
 extern uint8_t board_id;
-
-/* Touch board revisions */
-#define BRDREV_MM150 0
-#define BRDREV_TB160 1
-#define BRDREV_LC150 7
 
 /* Gotek board revisions */
 #define BRDREV_Gotek_standard 0xf

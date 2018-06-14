@@ -3,6 +3,8 @@ CC = $(TOOL_PREFIX)gcc
 OBJCOPY = $(TOOL_PREFIX)objcopy
 LD = $(TOOL_PREFIX)ld
 
+PYTHON = python2
+
 ifneq ($(VERBOSE),1)
 TOOL_PREFIX := @$(TOOL_PREFIX)
 endif
@@ -25,9 +27,6 @@ endif
 ifeq ($(bootloader),y)
 FLAGS += -DBOOTLOADER=1
 endif
-
-FLAGS-$(gotek) += -DBUILD_GOTEK=1
-FLAGS-$(touch) += -DBUILD_TOUCH=1
 
 FLAGS += -MMD -MF .$(@F).d
 DEPS = .*.d
@@ -95,7 +94,7 @@ build.o: $(OBJS)
 	$(CC) $(AFLAGS) -c $< -o $@
 
 clean:: $(addprefix _clean_,$(SUBDIRS) $(SUBDIRS-n) $(SUBDIRS-))
-	rm -f *~ *.o *.elf *.hex *.bin *.ld $(DEPS)
+	rm -f *.orig *.rej *~ *.o *.elf *.hex *.bin *.ld $(DEPS)
 _clean_%: FORCE
 	$(MAKE) -f $(ROOT)/Rules.mk -C $* clean
 

@@ -270,6 +270,14 @@ static uint8_t rotary;
 #define B_SELECT 4
 static void button_timer_fn(void *unused)
 {
+    /* Rotary encoder outputs a Gray code, counting clockwise: 00-01-11-10. */
+    const uint32_t rotary_transitions[] = {
+        [ROT_none]    = 0x00000000, /* No encoder */
+        [ROT_full]    = 0x20000100, /* 4 transitions (full cycle) per detent */
+        [ROT_half]    = 0x24000018, /* 2 transitions (half cycle) per detent */
+        [ROT_quarter] = 0x24428118  /* 1 transition (quarter cyc) per detent */
+    };
+
     static uint16_t bl, br, bs;
     uint8_t b = 0;
 
@@ -300,25 +308,8 @@ static void button_timer_fn(void *unused)
     if (bs == 0)
         b |= B_SELECT;
 
-    switch (ff_cfg.rotary) {
-    case ROT_gray: {
-        /* Gray code, counting clockwise: 00-01-11-10. */
-        const uint32_t dirs = 0x24428118;
-        rotary = ((rotary << 2) | ((gpioc->idr >> 10) & 3)) & 15;
-        b |= (dirs >> (rotary << 1)) & 3;
-        break;
-    }
-    case ROT_simple:
-        /* Rotary encoder: we look for a 1->0 edge (falling edge) on pin A. Pin
-         * B then tells us the direction (left or right). */
-        rotary <<= 1;
-        rotary |= gpio_read_pin(gpioc, 10);
-        if ((rotary & 0x03) == 0x02)
-            b |= (gpio_read_pin(gpioc, 11) == 0) ? B_LEFT : B_RIGHT;
-        break;
-    default:
-        break;
-    }
+    rotary = ((rotary << 2) | ((gpioc->idr >> 10) & 3)) & 15;
+    b |= (rotary_transitions[ff_cfg.rotary & 3] >> (rotary << 1)) & 3;
 
     b = lcd_handle_backlight(b);
 
@@ -348,6 +339,7 @@ static void slot_from_short_slot(
     slot->attributes = short_slot->attributes;
     slot->firstCluster = short_slot->firstCluster;
     slot->size = short_slot->size;
+    slot->dir_sect = slot->dir_ptr = 0;
 }
 
 static void fatfs_to_short_slot(
@@ -379,7 +371,8 @@ void fatfs_from_slot(FIL *file, const struct slot *slot, BYTE mode)
     file->obj.sclust = slot->firstCluster;
     file->obj.objsize = slot->size;
     file->flag = mode;
-    /* WARNING: dir_ptr, dir_sect are unknown. */
+    file->dir_sect = slot->dir_sect;
+    file->dir_ptr = (void *)slot->dir_ptr;
 }
 
 static void fatfs_to_slot(struct slot *slot, FIL *file, const char *name)
@@ -390,6 +383,8 @@ static void fatfs_to_slot(struct slot *slot, FIL *file, const char *name)
     slot->attributes = file->obj.attr;
     slot->firstCluster = file->obj.sclust;
     slot->size = file->obj.objsize;
+    slot->dir_sect = file->dir_sect;
+    slot->dir_ptr = (uint32_t)file->dir_ptr;
     snprintf(slot->name, sizeof(slot->name), "%s", name);
     if ((dot = strrchr(slot->name, '.')) != NULL) {
         snprintf(slot->type, sizeof(slot->type), "%s", dot+1);
@@ -487,7 +482,9 @@ static void read_ff_cfg(void)
                 : !strcmp(opts.arg, "ensoniq") ? HOST_ensoniq
                 : !strcmp(opts.arg, "gem") ? HOST_gem
                 : !strcmp(opts.arg, "memotech") ? HOST_memotech
+                : !strcmp(opts.arg, "msx") ? HOST_msx
                 : !strcmp(opts.arg, "pc98") ? HOST_pc98
+                : !strcmp(opts.arg, "pc-dos") ? HOST_pc_dos
                 : !strcmp(opts.arg, "ti99") ? HOST_ti99
                 : !strcmp(opts.arg, "uknc") ? HOST_uknc
                 : HOST_unspecified;
@@ -552,15 +549,18 @@ static void read_ff_cfg(void)
         case FFCFG_twobutton_action:
             ff_cfg.twobutton_action =
                 !strcmp(opts.arg, "rotary") ? TWOBUTTON_rotary
+                : !strcmp(opts.arg, "rotary-fast") ? TWOBUTTON_rotary_fast
                 : !strcmp(opts.arg, "eject") ? TWOBUTTON_eject
                 : TWOBUTTON_zero;
             break;
 
         case FFCFG_rotary:
             ff_cfg.rotary =
-                !strcmp(opts.arg, "gray") ? ROT_gray
+                !strcmp(opts.arg, "gray") ? ROT_quarter /* obsolete name */
+                : !strcmp(opts.arg, "quarter") ? ROT_quarter
+                : !strcmp(opts.arg, "half") ? ROT_half
                 : !strcmp(opts.arg, "none") ? ROT_none
-                : ROT_simple;
+                : ROT_full;
             break;
 
             /* DISPLAY */
@@ -636,6 +636,10 @@ static void read_ff_cfg(void)
             snprintf(ff_cfg.da_report_version,
                      sizeof(ff_cfg.da_report_version),
                      "%s", opts.arg);
+            break;
+
+        case FFCFG_extend_image:
+            ff_cfg.extend_image = !strcmp(opts.arg, "yes");
             break;
 
         }
@@ -1175,6 +1179,8 @@ static bool_t choose_new_image(uint8_t init_b)
             time_t delay = time_ms(1000) / (changes + 1);
             if (delay < time_ms(50))
                 delay = time_ms(50);
+            if (ff_cfg.twobutton_action == TWOBUTTON_rotary_fast)
+                delay = time_ms(40);
             if (time_diff(last_change, time_now()) < delay)
                 continue;
             changes++;
@@ -1195,7 +1201,8 @@ static bool_t choose_new_image(uint8_t init_b)
             }
             i = cfg.slot_nr = 0;
             cfg_update(CFG_KEEP_SLOT_NR);
-            if (ff_cfg.twobutton_action == TWOBUTTON_rotary) {
+            if ((ff_cfg.twobutton_action == TWOBUTTON_rotary)
+                || (ff_cfg.twobutton_action == TWOBUTTON_rotary_fast)) {
                 /* Wait for button release, then update display, or
                  * immediately enter parent-dir (if we're in a subfolder). */
                 while (buttons)
@@ -1696,8 +1703,7 @@ int main(void)
 
     usbh_msc_init();
 
-    if (ff_cfg.rotary == ROT_gray)
-        rotary = (gpioc->idr >> 10) & 3;
+    rotary = (gpioc->idr >> 10) & 3;
     timer_init(&button_timer, button_timer_fn, NULL);
     timer_set(&button_timer, time_now());
 
