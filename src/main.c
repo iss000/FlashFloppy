@@ -166,6 +166,7 @@ static void display_write_slot(bool_t nav_mode)
     }
     type = (cfg.slot.attributes & AM_DIR) ? "DIR"
         : slot_type("adf") ? "ADF"
+        : slot_type("d81") ? "D81"
         : slot_type("dsk") ? "DSK"
         : slot_type("hfe") ? "HFE"
         : slot_type("img") ? "IMG"
@@ -180,6 +181,8 @@ static void display_write_slot(bool_t nav_mode)
         : slot_type("ssd") ? "SSD"
         : slot_type("dsd") ? "DSD"
         : slot_type("sdu") ? "SDU"
+        : slot_type("jvc") ? "JVC"
+        : slot_type("vdk") ? "VDK"
         : slot_type("v9t9") ? "T99"
         : "UNK";
     snprintf(msg, sizeof(msg), "%03u/%03u%*s%s D:%u",
@@ -412,7 +415,7 @@ static void dump_file(void)
 
 static bool_t native_dir_next(void)
 {
-    do {
+    for (;;) {
         F_readdir(&fs->dp, &fs->fp);
         if (fs->fp.fname[0] == '\0')
             return FALSE;
@@ -424,10 +427,34 @@ static bool_t native_dir_next(void)
             continue;
         /* Allow folder navigation when LCD/OLED display is attached. */
         if ((fs->fp.fattrib & AM_DIR) && (display_mode == DM_LCD_1602)
-            && ((cfg.depth != 0) || strcmp(fs->fp.fname, "FF")))
+            /* Skip FF/ in root folder */
+            && ((cfg.depth != 0) || strcmp(fs->fp.fname, "FF"))
+            /* Skip __MACOSX/ zip-file resource-fork folder */
+            && strcmp(fs->fp.fname, "__MACOSX"))
             break;
-    } while (!image_valid(&fs->fp));
+        /* Allow valid image files. */
+        if (image_valid(&fs->fp))
+            break;
+    }
     return TRUE;
+}
+
+/* Parse pinNN= config value. */
+static uint8_t parse_pin_str(const char *s)
+{
+    uint8_t pin = 0;
+    if (*s == 'n') {
+        pin = PIN_invert;
+        s++;
+    }
+    pin ^= !strcmp(s, "low") ? PIN_low
+        : !strcmp(s, "high") ? PIN_high
+        : !strcmp(s, "c") ? (PIN_invert | PIN_nc)
+        : !strcmp(s, "rdy") ? PIN_rdy
+        : !strcmp(s, "dens") ? PIN_dens
+        : !strcmp(s, "chg") ? PIN_chg
+        : PIN_auto;
+    return pin;
 }
 
 static void read_ff_cfg(void)
@@ -479,17 +506,26 @@ static void read_ff_cfg(void)
             ff_cfg.host =
                 !strcmp(opts.arg, "acorn") ? HOST_acorn
                 : !strcmp(opts.arg, "akai") ? HOST_akai
+                : !strcmp(opts.arg, "dec") ? HOST_dec
                 : !strcmp(opts.arg, "ensoniq") ? HOST_ensoniq
                 : !strcmp(opts.arg, "gem") ? HOST_gem
                 : !strcmp(opts.arg, "memotech") ? HOST_memotech
                 : !strcmp(opts.arg, "msx") ? HOST_msx
                 : !strcmp(opts.arg, "pc98") ? HOST_pc98
                 : !strcmp(opts.arg, "pc-dos") ? HOST_pc_dos
+                : !strcmp(opts.arg, "tandy-coco") ? HOST_tandy_coco
                 : !strcmp(opts.arg, "ti99") ? HOST_ti99
                 : !strcmp(opts.arg, "uknc") ? HOST_uknc
                 : HOST_unspecified;
             break;
 
+        case FFCFG_pin02:
+            ff_cfg.pin02 = parse_pin_str(opts.arg);
+            break;
+
+        case FFCFG_pin34:
+            ff_cfg.pin34 = parse_pin_str(opts.arg);
+            break;
 
         case FFCFG_write_protect:
             ff_cfg.write_protect = !strcmp(opts.arg, "yes");
@@ -566,21 +602,34 @@ static void read_ff_cfg(void)
             /* DISPLAY */
 
         case FFCFG_display_type: {
-            char *p, *q;
+            char *p, *q, *r;
             ff_cfg.display_type = DISPLAY_auto;
             for (p = opts.arg; *p != '\0'; p = q) {
                 for (q = p; *q && *q != '-'; q++)
                     continue;
                 if (*q == '-')
                     *q++ = '\0';
-                if (!strcmp(p, "lcd"))
+                if (!strcmp(p, "lcd")) {
                     ff_cfg.display_type = DISPLAY_lcd;
-                if (!strcmp(p, "oled"))
+                } else if (!strcmp(p, "oled")) {
                     ff_cfg.display_type = DISPLAY_oled;
-                if (!strcmp(p, "rotate"))
+                } else if (!strcmp(p, "rotate")) {
                     ff_cfg.display_type |= DISPLAY_rotate;
-                if (!strcmp(p, "narrow"))
+                } else if (!strcmp(p, "narrow")) {
                     ff_cfg.display_type |= DISPLAY_narrow;
+                } else if (!strcmp(p, "sh1106")) {
+                    ff_cfg.display_type |= DISPLAY_sh1106;
+                } else if ((r = strchr(p, 'x')) != NULL) {
+                    unsigned int w, h;
+                    *r++ = '\0';
+                    w = strtol(p, NULL, 10);
+                    h = strtol(r, NULL, 10);
+                    if ((ff_cfg.display_type & DISPLAY_oled) && (h == 64)) {
+                        ff_cfg.display_type |= DISPLAY_oled_64;
+                    } else if (ff_cfg.display_type & DISPLAY_lcd) {
+                        ff_cfg.display_type |= DISPLAY_lcd_columns(w);
+                    }
+                }
             }
             break;
         }
@@ -652,8 +701,11 @@ static void read_ff_cfg(void)
 
 static void process_ff_cfg_opts(const struct ff_cfg *old)
 {
-    /* interface: Inform the floppy subsystem. */
-    floppy_set_fintf_mode(ff_cfg.interface);
+    /* interface, pin02, pin34: Inform the floppy subsystem. */
+    if ((ff_cfg.interface != old->interface)
+        || (ff_cfg.pin02 != old->pin02)
+        || (ff_cfg.pin34 != old->pin34))
+        floppy_set_fintf_mode();
 
     /* ejected-on-startup: Set the ejected state appropriately. */
     if (ff_cfg.ejected_on_startup)
@@ -1697,7 +1749,7 @@ int main(void)
 
     flash_ff_cfg_read();
 
-    floppy_init(ff_cfg.interface);
+    floppy_init();
 
     display_init();
 

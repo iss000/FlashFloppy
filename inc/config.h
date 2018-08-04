@@ -75,20 +75,20 @@ struct __packed ff_cfg {
 #define HOST_pc98        8
 #define HOST_pc_dos      9
 #define HOST_msx        10
+#define HOST_dec        11
+#define HOST_tandy_coco 12
     uint8_t host;
     /* Bitfields within display_type field. */
+#define DISPLAY_auto   0
 #define DISPLAY_lcd    (1<<0)
 #define DISPLAY_oled   (1<<1)
 #define DISPLAY_rotate (1<<2)
 #define DISPLAY_narrow (1<<3)
-    /* User-configurable composite values. */
-#define DISPLAY_auto               0
-#define DISPLAY_lcd_16x02          DISPLAY_lcd
-#define DISPLAY_oled_128x32        DISPLAY_oled
-#define DISPLAY_oled_128x32_rotate (DISPLAY_oled | DISPLAY_rotate)
-#define DISPLAY_oled_128x32_narrow (DISPLAY_oled | DISPLAY_narrow)
-    uint8_t display_type;
-    bool_t _unused0;
+#define DISPLAY_sh1106 (1<<4)
+#define DISPLAY_oled_64 (1<<5)
+#define _DISPLAY_lcd_columns 5
+#define DISPLAY_lcd_columns(x) ((x)<<_DISPLAY_lcd_columns)
+    uint16_t display_type;
 #define ROT_none    0
 #define ROT_full    1
 #define ROT_half    3
@@ -100,6 +100,18 @@ struct __packed ff_cfg {
     uint16_t display_scroll_pause;
     bool_t index_suppression;
     bool_t extend_image;
+#define PIN_auto   0
+#define PIN_nc     PIN_high
+#define PIN_high   (outp_nr + 1)
+#define PIN_rdy    (outp_rdy + 1)
+#define PIN_dens   (outp_hden + 1)
+#define PIN_chg    (outp_dskchg + 1)
+#define PIN_invert 0x80
+#define PIN_low    (PIN_high | PIN_invert)
+#define PIN_nrdy   (PIN_rdy | PIN_invert)
+#define PIN_ndens  (PIN_dens | PIN_invert)
+#define PIN_nchg   (PIN_chg | PIN_invert)
+    uint8_t pin02, pin34;
 };
 
 extern struct ff_cfg ff_cfg;

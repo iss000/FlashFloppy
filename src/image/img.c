@@ -1,12 +1,7 @@
 /*
  * img.c
  * 
- * Sector image files for IBM/ISO track formats:
- *  IMG/IMA: IBM/PC and others
- *  ST:      Atari ST
- *  ADL/ADM: Acorn 8-bit ADFS
- *  OPD:     Spectrum Opus Discovery
- *  TRD:     Spectrum TR-DOS
+ * Sector image files for IBM/ISO track formats.
  * 
  * Written & released by Keir Fraser <keir.xen@gmail.com>
  * 
@@ -29,8 +24,9 @@ static bool_t fm_write_track(struct image *im);
 static bool_t pc_dos_open(struct image *im);
 static bool_t ti99_open(struct image *im);
 
-#define LAYOUT_interleaved 0
-#define LAYOUT_sequential_reverse_side1 1
+#define LAYOUT_interleaved              0
+#define LAYOUT_interleaved_swap_sides   1
+#define LAYOUT_sequential_reverse_side1 2
 
 #define sec_sz(im) (128u << (im)->img.sec_no)
 
@@ -63,7 +59,7 @@ const static struct img_type {
     { 11, 2,  3, 2, 2, 1, 0, _C(80), _R(300) }, /* 880k */
     { 18, 2, 84, 1, 2, 1, 0, _C(80), _R(300) }, /* 1.44M */
     { 19, 2, 70, 1, 2, 1, 0, _C(80), _R(300) }, /* 1.52M */
-    { 21, 2, 18, 1, 2, 1, 0, _C(80), _R(300) }, /* 1.68M */
+    { 21, 2, 18, 2, 2, 1, 0, _C(80), _R(300) }, /* 1.68M */
     { 20, 2, 40, 1, 2, 1, 0, _C(80), _R(300) }, /* 1.6M */
     { 36, 2, 84, 1, 2, 1, 0, _C(80), _R(300) }, /* 2.88M */
     { 0 }
@@ -78,6 +74,12 @@ const static struct img_type {
     {  5, 2, 116, 1, 3, 1, 0, _C(80), _R(300) }, /* Akai DD:  5*1kB sectors */
     { 10, 2, 116, 1, 3, 1, 0, _C(80), _R(300) }, /* Akai HD: 10*1kB sectors */
     { 0 }
+}, d81_type[] = {
+    { 10, 2, 30, 1, 2, 1, 0, _C(80), _R(300) },
+    { 0 }
+}, dec_type[] = {
+    { 10, 1, 30, 1, 2, 1, 0, _C(80), _R(300) }, /* RX50 (400k) */
+    { 0 } /* RX33 (1.2MB) from default list */
 }, ensoniq_type[] = {
     { 10, 2, 30, 1, 2, 0, 0, _C(80), _R(300) },  /* Ensoniq 800kB */
     { 20, 2, 40, 1, 2, 0, 0, _C(80), _R(300) },  /* Ensoniq 1.6MB */
@@ -167,6 +169,9 @@ static bool_t img_open(struct image *im)
     case HOST_gem:
         type = akai_type;
         break;
+    case HOST_dec:
+        type = dec_type;
+        break;
     case HOST_ensoniq:
         type = ensoniq_type;
         break;
@@ -203,6 +208,12 @@ fallback:
     /* Fall back to default list. */
     memset(&im->img, 0, sizeof(im->img));
     return _img_open(im, TRUE, img_type);
+}
+
+static bool_t d81_open(struct image *im)
+{
+    im->img.layout = LAYOUT_interleaved_swap_sides;
+    return _img_open(im, TRUE, d81_type);
 }
 
 static bool_t st_open(struct image *im)
@@ -375,11 +386,12 @@ static bool_t opd_open(struct image *im)
     return _img_open(im, TRUE, NULL);
 }
 
-static bool_t ssd_open(struct image *im)
+static bool_t dfs_open(struct image *im)
 {
     im->nr_cyls = 80;
-    im->nr_sides = 1;
     im->img.interleave = 1;
+    im->img.skew = 3;
+    im->img.skew_cyls_only = TRUE;
     im->img.sec_no = 1; /* 256-byte */
     im->img.sec_base = 0;
     im->img.nr_sectors = 10;
@@ -388,17 +400,16 @@ static bool_t ssd_open(struct image *im)
     return fm_open(im);
 }
 
+static bool_t ssd_open(struct image *im)
+{
+    im->nr_sides = 1;
+    return dfs_open(im);
+}
+
 static bool_t dsd_open(struct image *im)
 {
-    im->nr_cyls = 80;
     im->nr_sides = 2;
-    im->img.interleave = 1;
-    im->img.sec_no = 1; /* 256-byte */
-    im->img.sec_base = 0;
-    im->img.nr_sectors = 10;
-    im->img.gap_3 = 21;
-
-    return fm_open(im);
+    return dfs_open(im);
 }
 
 static bool_t sdu_open(struct image *im)
@@ -552,8 +563,95 @@ static bool_t ti99_open(struct image *im)
     return FALSE;
 }
 
+static bool_t jvc_open(struct image *im)
+{
+    struct jvc {
+        uint8_t spt, sides, ssize_code, sec_id, attr;
+    } jvc = {
+        18, 1, 1, 1, 0
+    };
+    unsigned int bps, bpc;
+
+    im->img.base_off = f_size(&im->fp) & 255;
+
+    /* Check the image header. */
+    F_read(&im->fp, &jvc,
+           min_t(unsigned, im->img.base_off, sizeof(jvc)), NULL);
+    if (jvc.attr || ((jvc.sides != 1) && (jvc.sides != 2)) || (jvc.spt == 0))
+        return FALSE;
+
+    im->nr_sides = jvc.sides;
+    im->img.sec_no = jvc.ssize_code & 3;
+    im->img.interleave = 3; /* RSDOS likes a 3:1 interleave (ref. xroar) */
+    im->img.sec_base = jvc.sec_id;
+    im->img.nr_sectors = jvc.spt;
+
+    /* Calculate number of cylinders. */
+    bps = 128 << im->img.sec_no;
+    bpc = bps * im->img.nr_sectors * im->nr_sides;
+    im->nr_cyls = im_size(im) / bpc;
+    if ((im->nr_cyls >= 88) && (im->nr_sides == 1)) {
+        im->nr_sides++;
+        im->nr_cyls /= 2;
+        bpc *= 2;
+    }
+    if ((im_size(im) % bpc) >= bps)
+        im->nr_cyls++;
+
+    im->img.gap_3 = 20;
+    im->img.gap_4a = 54;
+    im->img.has_iam = TRUE;
+
+    return mfm_open(im);
+}
+
+static bool_t vdk_open(struct image *im)
+{
+    struct vdk {
+        char id[2];
+        uint16_t hlen;
+        uint8_t misc[4];
+        uint8_t cyls, heads;
+        uint8_t flags, compression;
+    } vdk;
+
+    /* Check the image header. */
+    F_read(&im->fp, &vdk, sizeof(vdk), NULL);
+    if (strncmp(vdk.id, "dk", 2) || le16toh(vdk.hlen < 12))
+        return FALSE;
+
+    /* Read (cyls, heads) geometry from the image header. */
+    im->nr_cyls = vdk.cyls;
+    im->nr_sides = vdk.heads;
+
+    /* Check the geometry. */
+    if ((im->nr_sides != 1) && (im->nr_sides != 2))
+        return FALSE;
+
+    /* Fill in the rest of the geometry. */
+    im->img.sec_no = 1; /* 256-byte sectors */
+    im->img.interleave = 2; /* DDOS likes a 2:1 interleave (ref. xroar) */
+    im->img.sec_base = 1;
+    im->img.nr_sectors = 18;
+    im->img.gap_3 = 20;
+    im->img.gap_4a = 54;
+    im->img.has_iam = TRUE;
+
+    im->img.base_off = le16toh(vdk.hlen);
+
+    return mfm_open(im);
+}
+
 const struct image_handler img_image_handler = {
     .open = img_open,
+    .setup_track = img_setup_track,
+    .read_track = img_read_track,
+    .rdata_flux = bc_rdata_flux,
+    .write_track = img_write_track,
+};
+
+const struct image_handler d81_image_handler = {
+    .open = d81_open,
     .setup_track = img_setup_track,
     .read_track = img_read_track,
     .rdata_flux = bc_rdata_flux,
@@ -635,6 +733,22 @@ const struct image_handler sdu_image_handler = {
     .write_track = img_write_track,
 };
 
+const struct image_handler jvc_image_handler = {
+    .open = jvc_open,
+    .setup_track = img_setup_track,
+    .read_track = img_read_track,
+    .rdata_flux = bc_rdata_flux,
+    .write_track = img_write_track,
+};
+
+const struct image_handler vdk_image_handler = {
+    .open = vdk_open,
+    .setup_track = img_setup_track,
+    .read_track = img_read_track,
+    .rdata_flux = bc_rdata_flux,
+    .write_track = img_write_track,
+};
+
 const struct image_handler ti99_image_handler = {
     .open = ti99_open,
     .setup_track = img_setup_track,
@@ -682,6 +796,9 @@ static void img_seek_track(
     case LAYOUT_sequential_reverse_side1:
         im->img.trk_off = (side ? im->nr_cyls - cyl : cyl) * trk_len;
         break;
+    case LAYOUT_interleaved_swap_sides:
+        trk ^= im->nr_sides - 1;
+        /* fall through */
     default:
         im->img.trk_off = trk * trk_len;
         break;

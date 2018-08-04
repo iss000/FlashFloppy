@@ -3,6 +3,40 @@
 ** Keir Fraser <keir.xen@gmail.com>
 ************************************
 
+** v0.9.27a - 27 July 2018
+ - Direct Navigation: Fix hidden-file and dot-file filtering
+ - Direct Navigation: Filter __MACOSX/ resource-fork folders
+
+** v0.9.26a - 24 July 2018
+ - DSK (CPC): More fixes for copy-protected tracks
+ - New image types supported:
+   - JVC, DSK: Tandy Coco (host=tandy-coco)
+   - VDK: Dragon
+
+** v0.9.25a - 18 July 2018
+ - DSK (Spectrum, CPC, Sam Coupe): Fix tracks with little or no data in them
+ - FF.CFG: New options pin02= and pin34= allow precise interface configuration
+
+** v0.9.24a - 9 July 2018
+ - DSK (Spectrum, CPC, Sam Coupe): Bug fixes. Please upgrade!
+
+** v0.9.23a - 6 July 2018
+ - DSK (Spectrum, CPC): Support weak-data copy protection
+   - Used on most of the top commercial titles
+ - OLED: Utilise all rows on 128x64 displays
+ - LCD: Support up to 40x2 displays
+ - SSD, DSD (BBC): Add correct sector skew across tracks
+ - IMG: 1680kB DMF has 2:1 sector interleave
+
+** v0.9.22a - 20 June 2018
+ - OLED: Support SH1106 controller (1.3-inch displays)
+   - FF.CFG: display-type = oled-128x64-sh1106
+ - Support a wider range of rotary encoders
+   - FF.CFG: rotary = quarter | half | full
+ - New image types supported:
+   - D81: Commodore 64 1581
+   - IMG: DEC RX33, RX50 (host=dec)
+
 ** v0.9.21a - 11 June 2018
  - New default 6x13 font (Codec, by Chris Cannam)
  - IMG: Support MSX (host=msx)
