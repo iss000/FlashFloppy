@@ -9,7 +9,7 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
-#define FW_VER "0.9.27a"
+#define FW_VER "0.9.28a"
 
 #ifndef NDEBUG
 #define ASSERT(p) do { if (!(p)) illegal(); } while (0)
@@ -77,6 +77,7 @@ int strncmp(const char *s1, const char *s2, size_t n);
 char *strchr(const char *s, int c);
 char *strrchr(const char *s, int c);
 int tolower(int c);
+int toupper(int c);
 int isspace(int c);
 
 long int strtol(const char *nptr, char **endptr, int base);

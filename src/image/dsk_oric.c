@@ -1,10 +1,9 @@
 /*
- * dsk_oric.c
+ * dsk.c
  * 
- * Oric DSK image files.
+ * Amstrad CPC DSK image files. Also used by Spectrum +3.
  * 
- * Based on dsk.c by Keir Fraser <keir.xen@gmail.com>
- * Adapted to Oric image format by iss 2018
+ * Written & released by Keir Fraser <keir.xen@gmail.com>
  * 
  * This is free and unencumbered software released into the public domain.
  * See the file COPYING for more details, or visit <http://unlicense.org>.
@@ -38,6 +37,21 @@ struct tib { /* track/cyl info */
     } sib[1];
 };
 
+#define n_sz(_sib) (128u << min_t(unsigned, (_sib)->n, 8))
+
+static uint16_t data_sz(struct sib *sib)
+{
+    uint16_t n_sz = n_sz(sib);
+    if (sib->actual_length == 0)
+        return 0;
+    return (sib->actual_length % n_sz) ? sib->actual_length : n_sz;
+}
+
+static bool_t is_gaps_sector(struct sib *sib)
+{
+    uint16_t dsz = data_sz(sib);
+    return ((dsz & (dsz-1)) || (dsz & 0x7f));
+}
 
 static struct dib *dib_p(struct image *im)
 {
@@ -102,9 +116,8 @@ static void dsk_oric_seek_track(
 
     if (cyl >= im->nr_cyls) {
     unformatted:
-        printk("T%u.%u: Unformatted\n", cyl, side);
+        printk("T%u.%u: Empty\n", cyl, side);
         memset(tib, 0, sizeof(*tib));
-        im->tracklen_bc = 100160;
         goto out;
     }
 
@@ -134,27 +147,27 @@ static void dsk_oric_seek_track(
         tib->nr_secs = 29;
 
     /* Compute per-sector actual length. */
-    for (i = 0; i < tib->nr_secs; i++) {
+    for (i = 0; i < tib->nr_secs; i++)
         tib->sib[i].actual_length = im->dsk.extended
-            ? le16toh(tib->sib[i].actual_length) : 128 << tib->sec_sz;
-        /* Clamp sector size */
-        if (tib->sib[i].actual_length > 16384) {
-            printk("Warn: clamp sector size %u\n",
-                   tib->sib[i].actual_length);
-            tib->sib[i].actual_length = 16384;
-        }
-    }
+            ? le16toh(tib->sib[i].actual_length)
+            : 128 << min_t(unsigned, tib->sec_sz, 8);
 
+out:
     im->dsk.idx_sz = GAP_4A;
     im->dsk.idx_sz += GAP_SYNC + 4 + GAP_1;
     im->dsk.idam_sz = GAP_SYNC + 8 + 2 + GAP_2;
-    im->dsk.dam_sz = GAP_SYNC + 4 + /*sec_sz +*/ 2 + tib->gap3;
+    im->dsk.dam_sz_pre = GAP_SYNC + 4;
+    im->dsk.dam_sz_post = 2 + tib->gap3;
 
     /* Work out minimum track length (with no pre-index track gap). */
-    tracklen = (im->dsk.idam_sz + im->dsk.dam_sz) * tib->nr_secs;
+    tracklen = (im->dsk.idam_sz + im->dsk.dam_sz_pre + im->dsk.dam_sz_post)
+        * tib->nr_secs;
     tracklen += im->dsk.idx_sz;
-    for (i = 0; i < tib->nr_secs; i++)
-        tracklen += tib->sib[i].actual_length;
+    for (i = 0; i < tib->nr_secs; i++) {
+        tracklen += data_sz(&tib->sib[i]);
+        if (is_gaps_sector(&tib->sib[i]))
+            tracklen -= im->dsk.dam_sz_post;
+    }
     tracklen *= 16;
 
     /* Calculate and round the track length. */
@@ -164,19 +177,76 @@ static void dsk_oric_seek_track(
     /* Now calculate the pre-index track gap. */
     im->dsk.gap4 = (im->tracklen_bc - tracklen) / 16;
 
-out:
     /* Calculate ticks per revolution */
     im->stk_per_rev = stk_sysclk(im->tracklen_bc * im->write_bc_ticks);
+}
+
+static uint32_t calc_start_pos(struct image *im)
+{
+    struct tib *tib = tib_p(im);
+    uint32_t decode_off;
+    unsigned int i;
+
+    /* Calculate start position within the track. */
+    im->dsk.crc = 0xffff;
+    im->dsk.trk_pos = im->dsk.rd_sec_pos = im->dsk.decode_data_pos = 0;
+    decode_off = im->cur_bc / 16;
+    if (decode_off < im->dsk.idx_sz) {
+        /* Post-index track gap */
+        im->dsk.decode_pos = 0;
+    } else {
+        decode_off -= im->dsk.idx_sz;
+        for (i = 0; i < tib->nr_secs; i++) {
+            uint16_t sec_sz = im->dsk.idam_sz + im->dsk.dam_sz_pre
+                + data_sz(&tib->sib[i]) + im->dsk.dam_sz_post;
+            if (is_gaps_sector(&tib->sib[i]))
+                sec_sz -= im->dsk.dam_sz_post;
+            if (decode_off < sec_sz)
+                break;
+            decode_off -= sec_sz;
+        }
+        if (i < tib->nr_secs) {
+            /* IDAM */
+            im->dsk.trk_pos = i;
+            im->dsk.decode_pos = i * 4 + 1;
+            if (decode_off >= im->dsk.idam_sz) {
+                /* DAM */
+                decode_off -= im->dsk.idam_sz;
+                im->dsk.decode_pos++;
+                if (decode_off >= im->dsk.dam_sz_pre) {
+                    /* Data or Post Data */
+                    decode_off -= im->dsk.dam_sz_pre;
+                    im->dsk.decode_pos++;
+                    if (decode_off < data_sz(&tib->sib[i])) {
+                        /* Data */
+                        im->dsk.rd_sec_pos = decode_off / 1024;
+                        im->dsk.decode_data_pos = im->dsk.rd_sec_pos;
+                        decode_off %= 1024;
+                    } else {
+                        /* Post Data */
+                        decode_off -= data_sz(&tib->sib[i]);
+                        im->dsk.decode_pos++;
+                        im->dsk.trk_pos = (i + 1) % tib->nr_secs;
+                    }
+                }
+            }
+        } else {
+            /* Pre-index track gap */
+            im->dsk.decode_pos = tib->nr_secs * 4 + 1;
+            im->dsk.decode_data_pos = decode_off / 1024;
+            decode_off %= 1024;
+        }
+    }
+
+    return decode_off;
 }
 
 static void dsk_oric_setup_track(
     struct image *im, uint16_t track, uint32_t *start_pos)
 {
-    struct tib *tib = tib_p(im);
     struct image_buf *rd = &im->bufs.read_data;
     struct image_buf *bc = &im->bufs.read_bc;
-    unsigned int i;
-    uint32_t decode_off = 0, sys_ticks = start_pos ? *start_pos : 0;
+    uint32_t decode_off, sys_ticks = start_pos ? *start_pos : 0;
     uint8_t cyl = track/2, side = track&1;
 
     side = min_t(uint8_t, side, im->nr_sides-1);
@@ -194,36 +264,7 @@ static void dsk_oric_setup_track(
     im->cur_ticks = im->cur_bc * im->ticks_per_cell;
     im->ticks_since_flux = 0;
 
-    if (tib->nr_secs != 0) {
-
-        /* Calculate start position within the track. */
-        im->dsk.trk_pos = 0;
-        decode_off = im->cur_bc / 16;
-        if (decode_off < im->dsk.idx_sz) {
-            im->dsk.decode_pos = 0;
-        } else {
-            decode_off -= im->dsk.idx_sz;
-            for (i = 0; i < tib->nr_secs; i++) {
-                uint16_t sec_sz = im->dsk.idam_sz + im->dsk.dam_sz
-                    + tib->sib[i].actual_length;
-                if (decode_off < sec_sz)
-                    break;
-                decode_off -= sec_sz;
-            }
-            if (i < tib->nr_secs) {
-                im->dsk.trk_pos = i;
-                im->dsk.decode_pos = i * 2 + 1;
-                if (decode_off >= im->dsk.idam_sz) {
-                    decode_off -= im->dsk.idam_sz;
-                    im->dsk.decode_pos++;
-                }
-            } else {
-                im->dsk.trk_pos = 0;
-                im->dsk.decode_pos = tib->nr_secs * 2 + 1;
-            }
-        }
-
-    }
+    decode_off = calc_start_pos(im);
 
     rd->prod = rd->cons = 0;
     bc->prod = bc->cons = 0;
@@ -246,21 +287,30 @@ static bool_t dsk_oric_read_track(struct image *im)
     uint16_t pr = 0, crc;
     unsigned int i;
 
-    if (tib->nr_secs == 0) {
-        /* Unformatted. */
-        bc->prod = bc->cons + bc->len*8;
-        return TRUE;
-    }
-
-    if (rd->prod == rd->cons) {
-        uint16_t off = 0;
+    if (tib->nr_secs && (rd->prod == rd->cons)) {
+        uint16_t off = 0, len;
         for (i = 0; i < im->dsk.trk_pos; i++)
             off += tib->sib[i].actual_length;
+        len = data_sz(&tib->sib[i]);
+        if (len != tib->sib[i].actual_length) {
+            /* Weak sector -- pick different data each revolution. */
+            off += len * (im->dsk.rev % (tib->sib[i].actual_length / len));
+        }
+        off += im->dsk.rd_sec_pos * 1024;
+        len -= im->dsk.rd_sec_pos * 1024;
+        if (len > 1024) {
+            len = 1024;
+            im->dsk.rd_sec_pos++;
+        } else {
+            im->dsk.rd_sec_pos = 0;
+            if (++im->dsk.trk_pos >= tib->nr_secs) {
+                im->dsk.trk_pos = 0;
+                im->dsk.rev++;
+            }
+        }
         F_lseek(&im->fp, im->dsk.trk_off + off);
-        F_read(&im->fp, buf, tib->sib[i].actual_length, NULL);
+        F_read(&im->fp, buf, len, NULL);
         rd->prod++;
-        if (++im->dsk.trk_pos >= tib->nr_secs)
-            im->dsk.trk_pos = 0;
     }
 
     /* Generate some MFM if there is space in the raw-bitcell ring buffer. */
@@ -278,7 +328,7 @@ static bool_t dsk_oric_read_track(struct image *im)
 
     if (im->dsk.decode_pos == 0) {
         /* Post-index track gap */
-        if (bc_space < (GAP_4A + GAP_SYNC + 4 + GAP_1))
+        if (bc_space < im->dsk.idx_sz)
             return FALSE;
         for (i = 0; i < GAP_4A; i++)
             emit_byte(0x4e);
@@ -290,62 +340,95 @@ static bool_t dsk_oric_read_track(struct image *im)
         emit_byte(0xfc);
         for (i = 0; i < GAP_1; i++)
             emit_byte(0x4e);
-    } else if (im->dsk.decode_pos == (tib->nr_secs * 2 + 1)) {
+    } else if (im->dsk.decode_pos == (tib->nr_secs * 4 + 1)) {
         /* Pre-index track gap */
-        if (bc_space < im->dsk.gap4)
+        uint16_t sz = im->dsk.gap4 - im->dsk.decode_data_pos * 1024;
+        if (bc_space < min_t(unsigned int, sz, 1024))
             return FALSE;
-        for (i = 0; i < im->dsk.gap4; i++)
-            emit_byte(0x4e);
-        im->dsk.decode_pos = -1;
-    } else if (im->dsk.decode_pos & 1) {
-        /* IDAM */
-        uint8_t sec = (im->dsk.decode_pos-1) >> 1;
-        uint8_t idam[8] = { 0xa1, 0xa1, 0xa1, 0xfe };
-        if (bc_space < (GAP_SYNC + 8 + 2 + GAP_2))
-            return FALSE;
-        if ((tib->sib[sec].stat1 & 0x01) && !(tib->sib[sec].stat2 & 0x01))
-            idam[3] = 0x00; /* Missing Address Mark (ID) */
-        memcpy(&idam[4], &tib->sib[sec].c, 4);
-        for (i = 0; i < GAP_SYNC; i++)
-            emit_byte(0x00);
-        for (i = 0; i < 3; i++)
-            emit_raw(0x4489);
-        for (; i < 8; i++)
-            emit_byte(idam[i]);
-        crc = crc16_ccitt(idam, sizeof(idam), 0xffff);
-        if ((tib->sib[sec].stat1 & 0x20) && !(tib->sib[sec].stat2 & 0x20))
-            crc = ~crc; /* CRC Error in ID */
-        emit_byte(crc >> 8);
-        emit_byte(crc);
-        for (i = 0; i < GAP_2; i++)
+        if (sz > 1024) {
+            sz = 1024;
+            im->dsk.decode_data_pos++;
+            im->dsk.decode_pos--;
+        } else {
+            im->dsk.decode_data_pos = 0;
+            im->dsk.decode_pos = -1;
+        }
+        for (i = 0; i < sz; i++)
             emit_byte(0x4e);
     } else {
-        /* DAM */
-        uint8_t sec = (im->dsk.decode_pos-2) >> 1;
-        uint16_t sec_sz = tib->sib[sec].actual_length;
-        uint8_t dam[4] = { 0xa1, 0xa1, 0xa1, 0xfb };
-        if (bc_space < (GAP_SYNC + 4 + sec_sz + 2 + tib->gap3))
-            return FALSE;
-        if ((tib->sib[sec].stat1 & 0x01) && (tib->sib[sec].stat2 & 0x01))
-            dam[3] = 0x00; /* Missing Address Mark (Data) */
-        else if (tib->sib[sec].stat2 & 0x40)
-            dam[3] = 0xf8; /* Found DDAM */
-        for (i = 0; i < GAP_SYNC; i++)
-            emit_byte(0x00);
-        for (i = 0; i < 3; i++)
-            emit_raw(0x4489);
-        emit_byte(dam[3]);
-        for (i = 0; i < sec_sz; i++)
-            emit_byte(buf[i]);
-        crc = crc16_ccitt(dam, sizeof(dam), 0xffff);
-        crc = crc16_ccitt(buf, sec_sz, crc);
-        if ((tib->sib[sec].stat1 & 0x20) && (tib->sib[sec].stat2 & 0x20))
-            crc = ~crc; /* CRC Error in Data */
-        emit_byte(crc >> 8);
-        emit_byte(crc);
-        for (i = 0; i < tib->gap3; i++)
-            emit_byte(0x4e);
-        rd->cons++;
+        uint8_t sec = (im->dsk.decode_pos-1) >> 2;
+        switch ((im->dsk.decode_pos - 1) & 3) {
+        case 0: /* IDAM */ {
+            uint8_t idam[8] = { 0xa1, 0xa1, 0xa1, 0xfe };
+            if (bc_space < (GAP_SYNC + 8 + 2 + GAP_2))
+                return FALSE;
+            if ((tib->sib[sec].stat1 & 0x01) && !(tib->sib[sec].stat2 & 0x01))
+                idam[3] = 0x00; /* Missing Address Mark (ID) */
+            memcpy(&idam[4], &tib->sib[sec].c, 4);
+            for (i = 0; i < GAP_SYNC; i++)
+                emit_byte(0x00);
+            for (i = 0; i < 3; i++)
+                emit_raw(0x4489);
+            for (; i < 8; i++)
+                emit_byte(idam[i]);
+            crc = crc16_ccitt(idam, sizeof(idam), 0xffff);
+            if ((tib->sib[sec].stat1 & 0x20) && !(tib->sib[sec].stat2 & 0x20))
+                crc = ~crc; /* CRC Error in ID */
+            emit_byte(crc >> 8);
+            emit_byte(crc);
+            for (i = 0; i < GAP_2; i++)
+                emit_byte(0x4e);
+            break;
+        }
+        case 1: /* DAM */ {
+            uint8_t dam[4] = { 0xa1, 0xa1, 0xa1, 0xfb };
+            if (bc_space < im->dsk.dam_sz_pre)
+                return FALSE;
+            if (tib->sib[sec].stat2 & 0x01)
+                dam[3] = 0x00; /* Missing Address Mark (Data) */
+            else if (tib->sib[sec].stat2 & 0x40)
+                dam[3] = 0xf8; /* Found DDAM */
+            for (i = 0; i < GAP_SYNC; i++)
+                emit_byte(0x00);
+            for (i = 0; i < 3; i++)
+                emit_raw(0x4489);
+            emit_byte(dam[3]);
+            im->dsk.crc = crc16_ccitt(dam, sizeof(dam), 0xffff);
+            break;
+        }
+        case 2: /* Data */ {
+            uint16_t sec_sz = data_sz(&tib->sib[sec]);
+            sec_sz -= im->dsk.decode_data_pos * 1024;
+            if (bc_space < min_t(unsigned int, sec_sz, 1024))
+                return FALSE;
+            if (sec_sz > 1024) {
+                sec_sz = 1024;
+                im->dsk.decode_data_pos++;
+                im->dsk.decode_pos--;
+            } else {
+                im->dsk.decode_data_pos = 0;
+            }
+            for (i = 0; i < sec_sz; i++)
+                emit_byte(buf[i]);
+            im->dsk.crc = crc16_ccitt(buf, sec_sz, im->dsk.crc);
+            rd->cons++;
+            break;
+        }
+        case 3: /* Post Data */ {
+            if (is_gaps_sector(&tib->sib[sec]))
+                break;
+            if (bc_space < im->dsk.dam_sz_post)
+                return FALSE;
+            crc = im->dsk.crc;
+            if ((tib->sib[sec].stat1 & 0x20) && (tib->sib[sec].stat2 & 0x20))
+                crc = ~crc; /* CRC Error in Data */
+            emit_byte(crc >> 8);
+            emit_byte(crc);
+            for (i = 0; i < tib->gap3; i++)
+                emit_byte(0x4e);
+            break;
+        }
+        }
     }
 
     im->dsk.decode_pos++;
@@ -378,11 +461,6 @@ static bool_t dsk_oric_write_track(struct image *im)
     if (flush)
         p = (write->bc_end + 15) / 16;
 
-    if (tib->nr_secs == 0) {
-        /* Unformatted. */
-        goto out;
-    }
-
     if (im->dsk.write_sector == -1) {
         /* Convert write offset to sector number (in rotational order). */
         base -= im->dsk.idx_sz + im->dsk.idam_sz;
@@ -390,8 +468,10 @@ static bool_t dsk_oric_write_track(struct image *im)
             /* Within small range of expected data start? */
             if ((base >= -64) && (base <= 64))
                 break;
-            base -= im->dsk.idam_sz + im->dsk.dam_sz
-                + tib->sib[i].actual_length;
+            base -= im->dsk.idam_sz + im->dsk.dam_sz_pre
+                + data_sz(&tib->sib[i]) + im->dsk.dam_sz_post;
+            if (is_gaps_sector(&tib->sib[i]))
+                base += im->dsk.dam_sz_post;
         }
         im->dsk.write_sector = i;
         if (im->dsk.write_sector >= tib->nr_secs) {
@@ -404,7 +484,7 @@ static bool_t dsk_oric_write_track(struct image *im)
     for (;;) {
 
         sec_sz = (im->dsk.write_sector >= 0)
-            ? tib->sib[im->dsk.write_sector].actual_length : 128;
+            ? data_sz(&tib->sib[im->dsk.write_sector]) : 128;
         if ((int16_t)(p - c) < (3 + sec_sz + 2))
             break;
 
@@ -477,7 +557,6 @@ static bool_t dsk_oric_write_track(struct image *im)
 
     wr->cons = c * 16;
 
-out:
     return flush;
 }
 
