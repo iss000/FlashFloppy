@@ -1,7 +1,6 @@
 OBJS += adf.o
 OBJS += da.o
 OBJS += dsk.o
-OBJS += dsk_oric.o
 OBJS += hfe.o
 OBJS += img.o
 OBJS += image.o
