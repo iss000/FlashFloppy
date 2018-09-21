@@ -2,7 +2,7 @@ https://github.com/keirf/FlashFloppy
 
 prerequisites:
   git
-  gcc-arm-none-eabi
+  gcc-arm-none-eabi (arm-none-eabi-binutils-cs arm-none-eabi-gcc-cs)
   srecord
   stm32flash
   python-crcmod
