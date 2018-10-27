@@ -1,6 +1,6 @@
 
 PROJ = FlashFloppy
-VER = v0.9.29a
+VER = v0.9.30a
 
 SUBDIRS += src bootloader reloader
 
@@ -28,7 +28,7 @@ gotek: all
 
 HXC_FF_URL := https://www.github.com/keirf/HxC_FF_File_Selector
 HXC_FF_URL := $(HXC_FF_URL)/releases/download
-HXC_FF_VER := v1.71-ff
+HXC_FF_VER := v1.72-ff
 
 dist:
 	rm -rf flashfloppy_*
