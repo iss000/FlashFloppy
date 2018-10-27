@@ -10,7 +10,7 @@ prerequisites:
 
 # git clone https://github.com/keirf/FlashFloppy.git
 # cd FlashFloppy
-# make dist
+# make mrproper dist
 
 
 # ~/work/repos/private/floppy/stm32flash-build/stm32flash -b 57600 -w ~/work/repos/private/floppy/stm32flash-build/FF_Gotek-*.hex /dev/ttyUSB0
