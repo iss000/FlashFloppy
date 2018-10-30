@@ -56,6 +56,8 @@ struct __packed ff_cfg {
 #define TWOBUTTON_eject       1
 #define TWOBUTTON_rotary      2
 #define TWOBUTTON_rotary_fast 3
+#define TWOBUTTON_mask        3
+#define TWOBUTTON_reverse     (1u<<7)
     uint8_t twobutton_action;
 #define NAVMODE_default 0
 #define NAVMODE_indexed 1
@@ -95,6 +97,7 @@ struct __packed ff_cfg {
 #define ROT_full    1
 #define ROT_half    3
 #define ROT_quarter 2
+#define ROT_reverse (1u<<7)
     uint8_t rotary;
     bool_t write_protect;
     uint16_t nav_scroll_rate;
@@ -114,6 +117,8 @@ struct __packed ff_cfg {
 #define PIN_ndens  (PIN_dens | PIN_invert)
 #define PIN_nchg   (PIN_chg | PIN_invert)
     uint8_t pin02, pin34;
+    uint8_t head_settle_ms;
+    uint8_t oled_contrast;
 };
 
 extern struct ff_cfg ff_cfg;
