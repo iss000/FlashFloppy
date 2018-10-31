@@ -596,9 +596,9 @@ static void read_ff_cfg(void)
             char *p, *q;
             ff_cfg.twobutton_action = TWOBUTTON_zero;
             for (p = opts.arg; *p != '\0'; p = q) {
-                for (q = p; *q && *q != '-'; q++)
+                for (q = p; *q && *q != ','; q++)
                     continue;
-                if (*q == '-')
+                if (*q == ',')
                     *q++ = '\0';
                 if (!strcmp(p, "reverse")) {
                     ff_cfg.twobutton_action |= TWOBUTTON_reverse;
@@ -618,9 +618,9 @@ static void read_ff_cfg(void)
             char *p, *q;
             ff_cfg.rotary = ROT_full;
             for (p = opts.arg; *p != '\0'; p = q) {
-                for (q = p; *q && *q != '-'; q++)
+                for (q = p; *q && *q != ','; q++)
                     continue;
-                if (*q == '-')
+                if (*q == ',')
                     *q++ = '\0';
                 if (!strcmp(p, "reverse")) {
                     ff_cfg.rotary |= ROT_reverse;
@@ -1795,6 +1795,21 @@ int main(void)
     floppy_init();
 
     display_init();
+
+    if (floppy_ribbon_is_reversed()) {
+        printk("** Error: Ribbon cable is upside down\n");
+        switch (display_mode) {
+        case DM_LED_7SEG:
+            led_7seg_write_string("RIB");
+            break;
+        case DM_LCD_1602:
+            lcd_write(0, 0, -1, "Ribbon Cable");
+            lcd_write(0, 1, -1, "Is Upside Down");
+            lcd_on();
+            break;
+        }
+        for (;;) ; /* Do nothing */
+    }
 
     usbh_msc_init();
 
