@@ -1,5 +1,5 @@
 
-export FW_VER := 0.11
+export FW_VER := 0.12
 
 PROJ := FlashFloppy
 VER := v$(FW_VER)
@@ -30,7 +30,7 @@ gotek: all
 
 HXC_FF_URL := https://www.github.com/keirf/HxC_FF_File_Selector
 HXC_FF_URL := $(HXC_FF_URL)/releases/download
-HXC_FF_VER := v1.73-ff
+HXC_FF_VER := v1.74-ff
 
 dist:
 	rm -rf flashfloppy-*
