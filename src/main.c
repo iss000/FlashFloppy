@@ -224,6 +224,12 @@ static void lcd_write_track_info(bool_t force)
         return;
 
     floppy_get_track(&cyl, &side, &sel, &writing);
+
+    if (cyl >= DA_FIRST_CYL) {
+        /* Display controlled by src/image/da.c */
+        return;
+    }
+
     cyl = min_t(uint8_t, cyl, 99);
     side = min_t(uint8_t, side, 1);
 
@@ -525,6 +531,7 @@ static void read_ff_cfg(void)
             ff_cfg.host =
                 !strcmp(opts.arg, "acorn") ? HOST_acorn
                 : !strcmp(opts.arg, "akai") ? HOST_akai
+                : !strcmp(opts.arg, "casio") ? HOST_casio
                 : !strcmp(opts.arg, "dec") ? HOST_dec
                 : !strcmp(opts.arg, "ensoniq") ? HOST_ensoniq
                 : !strcmp(opts.arg, "fluke") ? HOST_fluke
