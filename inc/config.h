@@ -125,6 +125,7 @@ struct __packed ff_cfg {
     uint8_t head_settle_ms;
     uint8_t oled_contrast;
     char indexed_prefix[8];
+    uint8_t display_mode;
 };
 
 extern struct ff_cfg ff_cfg;
