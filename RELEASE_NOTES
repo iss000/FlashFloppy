@@ -3,6 +3,22 @@
 ** Keir Fraser <keir.xen@gmail.com>
 ************************************
 
+** v2.3a - 8 April 2019
+ - OLED: Auto-detect SSD1306 vs SH1106 display controller
+   - FF.CFG: 'display-type = ...-sh1106' is now redundant and ignored
+ - ATR: Fix readability of downloaded ATR images
+   - Invert data as it is read/written, mirroring the standard XF551 interface
+   - Thanks to Piotr for this report (using his XF551 clone)
+
+** v2.2a - 5 April 2019
+ - New image types supported:
+   - XDF: 3.5" HD eXtended Disk Format (1840kB)
+   - ATR: Atari 8-bit
+ - 7-Seg LED: Improved track display.
+   - Remove option 'led-trk' from FF.CFG. Track display mode is always on.
+ - OLED: Fix horizontal offset on SH1106 128x32 displays
+ - IMG.CFG: 'id' parameter simplified; 'sskew' renamed 'hskew' (head skew)
+ 
 ** v2.1a - 26 March 2019
  - IMG.CFG: Allow up to 256 sectors per track
  - IMG.CFG: Split skew into per-cylinder and per-side values (cskew/sskew)

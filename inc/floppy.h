@@ -44,21 +44,38 @@ struct hfe_image {
     } write_batch;
 };
 
+struct raw_sec {
+    uint8_t id;
+    uint8_t no; /* 3 bits */
+};
+
+struct raw_trk {
+    uint16_t nr_sectors;
+    uint16_t sec_off;
+    uint16_t data_rate;
+    uint8_t gap_2, gap_3, gap_4a;
+    uint8_t has_iam:1, is_fm:1, invert_data:1;
+};
+
 struct img_image {
     uint32_t trk_off, base_off;
     uint16_t trk_sec, rd_sec_pos;
-    uint16_t rpm, nr_sectors;
+    uint16_t rpm;
     int32_t decode_pos;
     uint16_t decode_data_pos, crc;
     uint8_t layout; /* LAYOUT_* */
-    bool_t has_iam;
-    uint8_t gap_2, gap_3, gap_4a;
     uint8_t post_crc_syncs;
-    int8_t write_sector;
-    uint8_t sec_base[4], *sec_map;
-    uint8_t sec_no;
-    uint8_t interleave, cskew, sskew;
-    uint16_t data_rate, gap_4;
+    int16_t write_sector;
+    uint8_t *sec_map, *trk_map;
+    struct raw_trk *trk, *trk_info;
+    struct raw_sec *sec_info, *sec_info_base;
+    /* If not NULL, replaces the default method for finding sector data. 
+     * Sector data is at trk_off + file_sec_offsets[i]. */
+    uint32_t *file_sec_offsets;
+    /* Delay start of track this many bitcells past index. */
+    uint32_t track_delay_bc;
+    uint8_t interleave, cskew, hskew;
+    uint16_t gap_4;
     uint32_t idx_sz, idam_sz;
     uint16_t dam_sz_pre, dam_sz_post;
 };
