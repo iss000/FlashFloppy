@@ -9,7 +9,7 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
-static void raw_extend(struct image *im);
+static FSIZE_t raw_extend(struct image *im);
 static void raw_setup_track(
     struct image *im, uint16_t track, uint32_t *start_pos);
 static bool_t raw_read_track(struct image *im);
@@ -1450,10 +1450,12 @@ static bool_t raw_open(struct image *im)
 {
     im->img.rpm = im->img.rpm ?: 300;
     im->stk_per_rev = (stk_ms(200) * 300) / im->img.rpm;
+    volume_cache_init(im->bufs.write_data.p + 8192 + 2,
+                      im->img.heap_bottom);
     return TRUE;
 }
 
-static void raw_extend(struct image *im)
+static FSIZE_t raw_extend(struct image *im)
 {
     unsigned int i, j, sz = im->img.base_off;
     struct raw_trk *trk;
@@ -1468,13 +1470,7 @@ static void raw_extend(struct image *im)
         }
     }
 
-    if (f_size(&im->fp) >= sz)
-        return;
-
-    F_lseek(&im->fp, sz);
-    F_sync(&im->fp);
-    if (f_tell(&im->fp) != sz)
-        F_die(FR_DISK_FULL);
+    return sz;
 }
 
 static unsigned int file_idx(
@@ -1856,27 +1852,24 @@ static void img_fetch_data(struct image *im)
 {
     struct image_buf *rd = &im->bufs.read_data;
     uint8_t *buf = rd->p;
-    struct raw_sec *sec;
-    uint8_t *sec_map;
+    struct raw_sec *sec, *s;
+    uint8_t sec_i;
     uint16_t off, len;
-    unsigned int i;
 
     if (rd->prod != rd->cons)
         return;
 
+    sec_i = im->img.sec_map[im->img.trk_sec];
+    sec = &im->img.sec_info[sec_i];
+
     if (im->img.file_sec_offsets) {
-        sec_map = &im->img.sec_map[im->img.trk_sec];
-        off = im->img.file_sec_offsets[*sec_map];
+        off = im->img.file_sec_offsets[sec_i];
     } else {
         off = 0;
-        sec_map = im->img.sec_map;
-        for (i = 0; i < im->img.trk_sec; i++) {
-            sec = &im->img.sec_info[*sec_map++];
-            off += sec_sz(sec->no);
-        }
+        for (s = im->img.sec_info; s != sec; s++)
+            off += sec_sz(s->no);
     }
 
-    sec = &im->img.sec_info[*sec_map];
     len = sec_sz(sec->no);
 
     off += im->img.rd_sec_pos * 1024;
@@ -1906,8 +1899,9 @@ static void *align_p(void *p)
 static void check_p(void *p, struct image *im)
 {
     uint8_t *a = p, *b = (uint8_t *)im->bufs.read_data.p;
-    if ((int32_t)(a-b) < 8192)
+    if ((int32_t)(a-b) < (8192+2))
         F_die(FR_BAD_IMAGE);
+    im->img.heap_bottom = p;
 }
 
 static struct raw_trk *add_track_layout(
@@ -1980,6 +1974,8 @@ static void simple_layout(struct image *im, const struct simple_layout *layout)
     /* Create a track layout per side. */
     for (i = 0; i < im->nr_sides; i++) {
         trk = add_track_layout(im, layout->nr_sectors, i);
+        trk->is_fm = layout->is_fm;
+        trk->has_iam = layout->has_iam;
         trk->gap_3 = layout->gap3;
         trk->gap_4a = layout->gap4a;
         sec = &im->img.sec_info_base[trk->sec_off];

@@ -388,7 +388,7 @@ static void button_timer_fn(void *unused)
         [ROT_half]    = 0x24000018, /* 2 transitions (half cycle) per detent */
         [ROT_quarter] = 0x24428118  /* 1 transition (quarter cyc) per detent */
     };
-    const uint8_t rotary_reverse[] = {
+    const uint8_t rotary_reverse[4] = {
         [B_LEFT] = B_RIGHT, [B_RIGHT] = B_LEFT
     };
 
@@ -422,7 +422,17 @@ static void button_timer_fn(void *unused)
         b |= B_SELECT;
 
     rotary = ((rotary << 2) | ((gpioc->idr >> 10) & 3)) & 15;
-    rb = (rotary_transitions[ff_cfg.rotary & 3] >> (rotary << 1)) & 3;
+    switch (ff_cfg.rotary & ~ROT_reverse) {
+    case ROT_trackball:
+        rb = rotary_reverse[(rotary ^ (rotary >> 2)) & 3];
+        break;
+    case ROT_buttons:
+        rb = rotary_reverse[rotary & 3];
+        break;
+    default: /* rotary encoder */
+        rb = (rotary_transitions[ff_cfg.rotary & 3] >> (rotary << 1)) & 3;
+        break;
+    }
     if (ff_cfg.rotary & ROT_reverse)
         rb = rotary_reverse[rb];
     b |= rb;
@@ -821,6 +831,8 @@ static void read_ff_cfg(void)
                         !strcmp(p, "gray") ? ROT_quarter /* obsolete name */
                         : !strcmp(p, "quarter") ? ROT_quarter
                         : !strcmp(p, "half") ? ROT_half
+                        : !strcmp(p, "trackball") ? ROT_trackball
+                        : !strcmp(p, "buttons") ? ROT_buttons
                         : !strcmp(p, "none") ? ROT_none
                         : ROT_full;
                 }
@@ -1597,6 +1609,26 @@ static int run_floppy(void *_b)
     return 0;
 }
 
+static void floppy_arena_setup(void)
+{
+    unsigned int cache_len;
+    uint8_t *cache_start;
+
+    arena_init();
+
+    fs = arena_alloc(sizeof(*fs));
+
+    cache_len = arena_avail();
+    cache_start = arena_alloc(cache_len);
+    volume_cache_init(cache_start, cache_start + cache_len);
+}
+
+static void floppy_arena_teardown(void)
+{
+    fs = NULL;
+    volume_cache_destroy();
+}
+
 static int floppy_main(void *unused)
 {
     FRESULT fres;
@@ -1609,8 +1641,7 @@ static int floppy_main(void *unused)
     if (buttons)
         cfg.ejected = TRUE;
 
-    arena_init();
-    fs = arena_alloc(sizeof(*fs));
+    floppy_arena_setup();
     
     cfg_init();
     cfg_update(CFG_READ_SLOT_NR);
@@ -1667,8 +1698,6 @@ static int floppy_main(void *unused)
             goto select;
         }
 
-        fs = NULL;
-
         display_write_slot(FALSE);
         if (display_mode == DM_LCD_1602)
             lcd_write_track_info(TRUE);
@@ -1682,13 +1711,12 @@ static int floppy_main(void *unused)
             cfg.ejected = FALSE;
             b = B_SELECT;
         } else {
+            floppy_arena_teardown();
             fres = F_call_cancellable(run_floppy, &b);
             floppy_cancel();
             assert_volume_connected();
+            floppy_arena_setup();
         }
-
-        arena_init();
-        fs = arena_alloc(sizeof(*fs));
 
         if (cfg.dirty_slot_nr) {
             cfg.dirty_slot_nr = FALSE;
@@ -2064,9 +2092,9 @@ int main(void)
         }
         usbh_msc_buffer_set((void *)0xdeadbeef);
 
-        arena_init();
         fres = F_call_cancellable(floppy_main, NULL);
         floppy_cancel();
+        floppy_arena_teardown();
 
         handle_errors(fres);
     }
