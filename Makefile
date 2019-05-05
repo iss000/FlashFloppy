@@ -1,5 +1,5 @@
 
-export FW_VER := 2.6a
+export FW_VER := 2.7a
 
 PROJ := FlashFloppy
 VER := v$(FW_VER)
@@ -54,6 +54,7 @@ dist:
 	mv HxC_Compat_Mode flashfloppy-$(VER)
 	mkdir -p flashfloppy-$(VER)/scripts
 	cp -a scripts/edsk* flashfloppy-$(VER)/scripts/
+	cp -a scripts/mk_hfe.py flashfloppy-$(VER)/scripts/
 	zip -r flashfloppy-$(VER).zip flashfloppy-$(VER)
 
 mrproper: clean

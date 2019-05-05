@@ -19,6 +19,11 @@ static struct {
     char buf[512];
 } *fs;
 
+struct native_dirent {
+    uint32_t dir_sect, dir_ptr;
+    char name[0];
+};
+
 static struct {
     uint16_t slot_nr, max_slot_nr;
     uint8_t slot_map[1000/8];
@@ -28,6 +33,7 @@ static struct {
     };
     struct slot slot;
     uint32_t cfg_cdir, cur_cdir;
+    struct native_dirent **sorted;
     struct {
         uint32_t cdir;
         uint16_t slot;
@@ -35,6 +41,7 @@ static struct {
     uint8_t depth;
     bool_t usb_power_fault;
     uint8_t dirty_slot_nr:1;
+    uint8_t dirty_slot_name:1;
     uint8_t hxc_mode:1;
     uint8_t ejected:1;
     uint8_t ima_ej_flag:1; /* "\\EJ" flag in IMAGE_A.CFG? */
@@ -55,6 +62,11 @@ static uint8_t display_state;
 enum { BACKLIGHT_OFF, BACKLIGHT_SWITCHING_ON, BACKLIGHT_ON };
 enum { LED_NORMAL, LED_TRACK, LED_TRACK_QUIESCENT,
        LED_BUTTON_HELD, LED_BUTTON_RELEASED };
+
+static void native_get_slot_map(bool_t sorted_only);
+
+/* Hack inside the guts of FatFS. */
+void flashfloppy_fill_fileinfo(FIL *fp);
 
 static bool_t slot_valid(unsigned int i)
 {
@@ -79,6 +91,12 @@ bool_t set_slot_nr(uint16_t slot_nr)
     cfg.slot_nr = slot_nr;
     cfg.dirty_slot_nr = TRUE;
     return TRUE;
+}
+
+void set_slot_name(const char *name)
+{
+    snprintf(cfg.slot.name, sizeof(cfg.slot.name), "%s", name);
+    cfg.dirty_slot_name = TRUE;
 }
 
 /* Turn the LCD backlight on, reset the switch-off handler and ticker. */
@@ -577,23 +595,101 @@ static bool_t native_dir_next(void)
     return TRUE;
 }
 
-int set_slot_by_name(const char *name, void *scratch)
+static inline int __tolower(int c)
 {
-    bool_t ok;
-    int nr = -1;
+    if ((c >= 'A') && (c <= 'Z'))
+        c += 'a' - 'A';
+    return c;
+}
+
+int strcmp_lower(const char *s1, const char *s2)
+{
+    for (;;) {
+        int diff = __tolower(*s1) - __tolower(*s2);
+        if (diff || !*s1)
+            return diff;
+        s1++; s2++;
+    }
+    return 0;
+}
+
+static int native_dir_cmp(const void *a, const void *b)
+{
+    const struct native_dirent *da = a;
+    const struct native_dirent *db = b;
+    return strcmp_lower(da->name, db->name);
+}
+
+static unsigned int native_read_dir(void)
+{
+    struct native_dirent **p_ent, **p_ents = arena_alloc(0);
+    struct native_dirent *ent = (struct native_dirent *)(p_ents + 1000);
+    char *end = arena_alloc(0) + arena_avail();
+    int nr;
+
+    if (ff_cfg.folder_sort == SORT_never)
+        return 0;
+
+    volume_cache_destroy();
+
+    F_opendir(&fs->dp, "");
+    p_ent = p_ents;
+    while ((end - (char *)ent) > (FF_MAX_LFN + 1 + sizeof(*ent))) {
+        if (!native_dir_next())
+            goto complete;
+        *p_ent++ = ent;
+        ent->dir_sect = fs->fp.dir_sect;
+        ent->dir_ptr = (uint32_t)fs->fp.dir_ptr;
+        strcpy(ent->name, fs->fp.fname);
+        ent = (struct native_dirent *)(
+            ((uint32_t)ent + sizeof(*ent) + strlen(ent->name) + 1 + 3) & ~3);
+    }
+
+    if (ff_cfg.folder_sort == SORT_always)
+        goto complete;
+
+    volume_cache_init(p_ents, end);
+    cfg.sorted = NULL;
+    return 0;
+
+complete:
+    nr = p_ent - p_ents;
+
+    qsort_p(p_ents, nr, native_dir_cmp);
+
+    F_closedir(&fs->dp);
+
+    volume_cache_init(ent, end);
+    cfg.sorted = p_ents;
+    return nr;
+}
+
+static void update_slot_by_name(void)
+{
+    const char *name = cfg.slot.name;
     int len = strnlen(name, 256);
+    int nr = ~0, max;
 
-    fs = scratch; /* XXX not very tasty */
+    if (cfg.sorted) {
 
-    if (!cfg.hxc_mode) {
+        max = cfg.max_slot_nr;
+        if (cfg.depth)
+            max--;
+        for (nr = 0; nr <= max; nr++)
+            if (!strncmp(cfg.sorted[nr]->name, name, len))
+                break;
+        if (cfg.depth)
+            nr++;
+
+    }
+
+    else if (!cfg.hxc_mode) {
 
         nr = cfg.depth ? 1 : 0;
         F_opendir(&fs->dp, "");
-        while ((ok = native_dir_next()) && strncmp(fs->fp.fname, name, len))
+        while (native_dir_next() && strncmp(fs->fp.fname, name, len))
             nr++;
         F_closedir(&fs->dp);
-        if (!ok || !set_slot_nr(nr))
-            nr = -1;
 
     } else if (ff_cfg.nav_mode != NAVMODE_indexed) {
 
@@ -601,7 +697,7 @@ int set_slot_by_name(const char *name, void *scratch)
             struct hxcsdfe_cfg cfg;
             struct v1_slot v1_slot;
             struct v2_slot v2_slot;
-        } *hxc = (struct _hxc *)&fs->dp; /* XXX also not nice */
+        } *hxc = (struct _hxc *)fs->buf;
         struct slot *slot = (struct slot *)hxc;
         
         slot_from_short_slot(slot, &cfg.hxcsdfe);
@@ -632,14 +728,11 @@ int set_slot_by_name(const char *name, void *scratch)
                 break;
         }
 
-        if ((nr <= 0) || !set_slot_nr(nr))
-            nr = -1;
-
     }
 
+    set_slot_nr(nr);
 out:
-    fs = NULL;
-    return nr;
+    cfg.dirty_slot_nr = TRUE;
 }
 
 /* Parse pinNN= config value. */
@@ -780,6 +873,13 @@ static void read_ff_cfg(void)
 
         case FFCFG_autoselect_folder_secs:
             ff_cfg.autoselect_folder_secs = strtol(opts.arg, NULL, 10);
+            break;
+
+        case FFCFG_folder_sort:
+            ff_cfg.folder_sort =
+                !strcmp(opts.arg, "never") ? SORT_never
+                : !strcmp(opts.arg, "small") ? SORT_small
+                : SORT_always;
             break;
 
         case FFCFG_nav_mode:
@@ -949,7 +1049,7 @@ static void read_ff_cfg(void)
 
     F_close(&fs->file);
 
-    flash_ff_cfg_update();
+    flash_ff_cfg_update(fs->buf);
 }
 
 static void process_ff_cfg_opts(const struct ff_cfg *old)
@@ -974,13 +1074,14 @@ static void process_ff_cfg_opts(const struct ff_cfg *old)
 static void cfg_init(void)
 {
     struct ff_cfg old_ff_cfg = ff_cfg;
-    struct hxcsdfe_cfg hxc_cfg;
+    struct hxcsdfe_cfg *hxc_cfg;
     unsigned int sofar;
     char *p;
     BYTE mode;
     FRESULT fr;
 
     cfg.dirty_slot_nr = FALSE;
+    cfg.dirty_slot_name = FALSE;
     cfg.hxc_mode = FALSE;
     cfg.ima_ej_flag = FALSE;
     cfg.slot_nr = cfg.depth = 0;
@@ -1008,18 +1109,19 @@ static void cfg_init(void)
     if (fr)
         goto native_mode;
     fatfs_to_short_slot(&cfg.hxcsdfe, &fs->file, "HXCSDFE.CFG");
-    F_read(&fs->file, &hxc_cfg, sizeof(hxc_cfg), NULL);
-    if (hxc_cfg.startup_mode & HXCSTARTUP_slot0) {
+    hxc_cfg = (struct hxcsdfe_cfg *)fs->buf;
+    F_read(&fs->file, hxc_cfg, sizeof(*hxc_cfg), NULL);
+    if (hxc_cfg->startup_mode & HXCSTARTUP_slot0) {
         /* Startup mode: slot 0. */
-        hxc_cfg.slot_index = hxc_cfg.cur_slot_number = 0;
+        hxc_cfg->slot_index = hxc_cfg->cur_slot_number = 0;
         F_lseek(&fs->file, 0);
-        F_write(&fs->file, &hxc_cfg, sizeof(hxc_cfg), NULL);
+        F_write(&fs->file, hxc_cfg, sizeof(*hxc_cfg), NULL);
     }
-    if (hxc_cfg.startup_mode & HXCSTARTUP_ejected) {
+    if (hxc_cfg->startup_mode & HXCSTARTUP_ejected) {
         /* Startup mode: eject. */
         cfg.ejected = TRUE;
     }
-
+    hxc_cfg = NULL;
     F_close(&fs->file);
 
     /* Slot 0 is a dummy image unless AUTOBOOT.HFE exists. */
@@ -1062,7 +1164,7 @@ native_mode:
     sofar = 0; /* bytes consumed so far */
     fatfs.cdir = cfg.cur_cdir;
     for (;;) {
-        unsigned int nr = cfg.depth ? 1 : 0;
+        int nr;
         bool_t ok;
         /* Read next pathname section, search for its terminating slash. */
         F_read(&fs->file, fs->buf, sizeof(fs->buf), NULL);
@@ -1078,12 +1180,21 @@ native_mode:
         if (cfg.depth == ARRAY_SIZE(cfg.stack))
             F_die(FR_PATH_TOO_DEEP);
         /* Find slot nr, and stack it */
-        F_opendir(&fs->dp, "");
-        while ((ok = native_dir_next()) && strcmp(fs->fp.fname, fs->buf))
-            nr++;
-        F_closedir(&fs->dp);
+        if ((nr = native_read_dir()) != 0) {
+            while (--nr >= 0)
+                if (!strcmp(cfg.sorted[nr]->name, fs->buf))
+                    break;
+            ok = (nr >= 0);
+            cfg.sorted = NULL;
+        } else {
+            F_opendir(&fs->dp, "");
+            while ((ok = native_dir_next()) && strcmp(fs->fp.fname, fs->buf))
+                nr++;
+            F_closedir(&fs->dp);
+        }
         if (!ok)
             goto clear_image_a;
+        nr += cfg.depth ? 1 : 0;
         cfg.stack[cfg.depth].slot = nr;
         cfg.stack[cfg.depth++].cdir = fatfs.cdir;
         fr = f_chdir(fs->buf);
@@ -1113,12 +1224,23 @@ native_mode:
         /* If there was a non-empty non-terminated pathname section, it 
          * must be the name of the currently-selected image file. */
         bool_t ok;
+        int i, nr;
         printk("%u:F: '%s' %s\n", cfg.depth, fs->buf,
                cfg.ima_ej_flag ? "(EJ)" : "");
-        F_opendir(&fs->dp, "");
-        while ((ok = native_dir_next()) && strcmp(fs->fp.fname, fs->buf))
-            cfg.slot_nr++;
-        F_closedir(&fs->dp);
+        native_get_slot_map(TRUE);
+        if (cfg.sorted) {
+            nr = cfg.max_slot_nr + 1 - cfg.slot_nr;
+            for (i = 0; i < nr; i++)
+                if (!strcmp(cfg.sorted[i]->name, fs->buf))
+                    break;
+            ok = (i < nr);
+            cfg.slot_nr += i;
+        } else {
+            F_opendir(&fs->dp, "");
+            while ((ok = native_dir_next()) && strcmp(fs->fp.fname, fs->buf))
+                cfg.slot_nr++;
+            F_closedir(&fs->dp);
+        }
         if (!ok)
             goto clear_image_a;
     }
@@ -1143,6 +1265,34 @@ clear_image_a:
     goto out;
 }
 
+static void native_get_slot_map(bool_t sorted_only)
+{
+    int i;
+
+    /* Populate slot_map[]. */
+    memset(&cfg.slot_map, 0xff, sizeof(cfg.slot_map));
+    cfg.max_slot_nr = cfg.depth ? 1 : 0;
+
+    if ((i = native_read_dir()) != 0) {
+        cfg.max_slot_nr += i;
+    } else {
+        if (sorted_only)
+            return;
+        F_opendir(&fs->dp, "");
+        while (native_dir_next())
+            cfg.max_slot_nr++;
+        F_closedir(&fs->dp);
+    }
+
+    /* Adjust max_slot_nr. Must be at least one 'slot'. */
+    if (!cfg.max_slot_nr)
+        F_die(FR_NO_DIRENTS);
+    cfg.max_slot_nr--;
+
+    /* Select last disk_index if not greater than available slots. */
+    cfg.slot_nr = (cfg.slot_nr <= cfg.max_slot_nr) ? cfg.slot_nr : 0;
+}
+
 #define CFG_KEEP_SLOT_NR  0 /* Do not re-read slot number from config */
 #define CFG_READ_SLOT_NR  1 /* Read slot number afresh from config */
 #define CFG_WRITE_SLOT_NR 2 /* Write new slot number to config */
@@ -1151,21 +1301,8 @@ static void native_update(uint8_t slot_mode)
 {
     int i;
 
-    if (slot_mode == CFG_READ_SLOT_NR) {
-        /* Populate slot_map[]. */
-        memset(&cfg.slot_map, 0xff, sizeof(cfg.slot_map));
-        cfg.max_slot_nr = cfg.depth ? 1 : 0;
-        F_opendir(&fs->dp, "");
-        while (native_dir_next())
-            cfg.max_slot_nr++;
-        /* Adjust max_slot_nr. Must be at least one 'slot'. */
-        if (!cfg.max_slot_nr)
-            F_die(FR_NO_DIRENTS);
-        cfg.max_slot_nr--;
-        F_closedir(&fs->dp);
-        /* Select last disk_index if not greater than available slots. */
-        cfg.slot_nr = (cfg.slot_nr <= cfg.max_slot_nr) ? cfg.slot_nr : 0;
-    }
+    if ((slot_mode == CFG_READ_SLOT_NR) && !cfg.sorted)
+        native_get_slot_map(FALSE);
 
     if ((ff_cfg.image_on_startup == IMGS_last)
         && (slot_mode == CFG_WRITE_SLOT_NR)) {
@@ -1216,28 +1353,48 @@ static void native_update(uint8_t slot_mode)
     }
     
     /* Populate current slot. */
-    i = cfg.depth ? 1 : 0;
-    F_opendir(&fs->dp, "");
-    while (native_dir_next()) {
-        if (i >= cfg.slot_nr)
-            break;
-        i++;
-    }
-    F_closedir(&fs->dp);
-    if (i > cfg.slot_nr) {
+    if ((i = cfg.depth ? 1 : 0) > cfg.slot_nr) {
         /* Must be the ".." folder. */
         snprintf(fs->fp.fname, sizeof(fs->fp.fname), "..");
         fs->fp.fattrib = AM_DIR;
+        goto is_dir;
     }
-    if (fs->fp.fattrib & AM_DIR) {
-        /* Leave the full pathname cached in fs->fp. */
-        cfg.slot.attributes = fs->fp.fattrib;
-        snprintf(cfg.slot.name, sizeof(cfg.slot.name), "[%s]", fs->fp.fname);
-    } else {
-        F_open(&fs->file, fs->fp.fname, FA_READ);
-        fs->file.obj.attr = fs->fp.fattrib;
+
+    if (cfg.sorted) {
+
+        struct native_dirent *ent = cfg.sorted[cfg.slot_nr-i];
+        snprintf(fs->fp.fname, sizeof(fs->fp.fname), ent->name);
+        fs->file.obj.fs = &fatfs;
+        fs->file.dir_sect = ent->dir_sect;
+        fs->file.dir_ptr = (BYTE *)ent->dir_ptr;
+        flashfloppy_fill_fileinfo(&fs->file);
+        fs->fp.fattrib = fs->file.obj.attr;
+        if (fs->file.obj.attr & AM_DIR)
+            goto is_dir;
         fatfs_to_slot(&cfg.slot, &fs->file, fs->fp.fname);
-        F_close(&fs->file);
+
+    } else {
+
+        F_opendir(&fs->dp, "");
+        while (native_dir_next()) {
+            if (i >= cfg.slot_nr)
+                break;
+            i++;
+        }
+        F_closedir(&fs->dp);
+        if (fs->fp.fattrib & AM_DIR) {
+        is_dir:
+            /* Leave the full pathname cached in fs->fp. */
+            cfg.slot.attributes = fs->fp.fattrib;
+            snprintf(cfg.slot.name, sizeof(cfg.slot.name),
+                     "[%s]", fs->fp.fname);
+        } else {
+            F_open(&fs->file, fs->fp.fname, FA_READ);
+            fs->file.obj.attr = fs->fp.fattrib;
+            fatfs_to_slot(&cfg.slot, &fs->file, fs->fp.fname);
+            F_close(&fs->file);
+        }
+
     }
 }
 
@@ -1265,9 +1422,11 @@ static void ima_mark_ejected(bool_t ej)
 
 static void hxc_cfg_update(uint8_t slot_mode)
 {
-    struct hxcsdfe_cfg hxc_cfg;
-    struct v1_slot v1_slot;
-    struct v2_slot v2_slot;
+    struct _hxc {
+        struct hxcsdfe_cfg cfg;
+        struct v1_slot v1_slot;
+        struct v2_slot v2_slot;
+    } *hxc = (struct _hxc *)fs->buf;
     BYTE mode = FA_READ;
     int i;
 
@@ -1277,7 +1436,7 @@ static void hxc_cfg_update(uint8_t slot_mode)
     if (ff_cfg.nav_mode == NAVMODE_indexed) {
         FRESULT fr;
         char slot[10];
-        hxc_cfg.index_mode = TRUE;
+        hxc->cfg.index_mode = TRUE;
         fatfs.cdir = cfg.cfg_cdir;
         switch (slot_mode) {
         case CFG_READ_SLOT_NR:
@@ -1307,40 +1466,40 @@ static void hxc_cfg_update(uint8_t slot_mode)
 
     slot_from_short_slot(&cfg.slot, &cfg.hxcsdfe);
     fatfs_from_slot(&fs->file, &cfg.slot, mode);
-    F_read(&fs->file, &hxc_cfg, sizeof(hxc_cfg), NULL);
-    if (strncmp("HXCFECFGV", hxc_cfg.signature, 9))
+    F_read(&fs->file, &hxc->cfg, sizeof(hxc->cfg), NULL);
+    if (strncmp("HXCFECFGV", hxc->cfg.signature, 9))
         goto bad_signature;
 
     if (slot_mode == CFG_READ_SLOT_NR) {
         /* buzzer_step_duration seems to range 0xFF-0xD8. */
         if (!cfg.ffcfg_has_step_volume)
-            ff_cfg.step_volume = hxc_cfg.step_sound
-                ? (0x100 - hxc_cfg.buzzer_step_duration) / 2 : 0;
+            ff_cfg.step_volume = hxc->cfg.step_sound
+                ? (0x100 - hxc->cfg.buzzer_step_duration) / 2 : 0;
         if (!cfg.ffcfg_has_display_off_secs)
-            ff_cfg.display_off_secs = hxc_cfg.back_light_tmr;
+            ff_cfg.display_off_secs = hxc->cfg.back_light_tmr;
         /* Interpret HxC scroll speed as updates per minute. */
-        if (!cfg.ffcfg_has_display_scroll_rate && hxc_cfg.lcd_scroll_speed)
-            ff_cfg.display_scroll_rate = 60000u / hxc_cfg.lcd_scroll_speed;
+        if (!cfg.ffcfg_has_display_scroll_rate && hxc->cfg.lcd_scroll_speed)
+            ff_cfg.display_scroll_rate = 60000u / hxc->cfg.lcd_scroll_speed;
     }
 
-    switch (hxc_cfg.signature[9]-'0') {
+    switch (hxc->cfg.signature[9]-'0') {
 
     case 1: {
         if (slot_mode != CFG_READ_SLOT_NR) {
             /* Keep the already-configured slot number. */
-            hxc_cfg.slot_index = cfg.slot_nr;
+            hxc->cfg.slot_index = cfg.slot_nr;
             if (slot_mode == CFG_WRITE_SLOT_NR) {
                 /* Update the config file with new slot number. */
                 F_lseek(&fs->file, 0);
-                F_write(&fs->file, &hxc_cfg, sizeof(hxc_cfg), NULL);
+                F_write(&fs->file, &hxc->cfg, sizeof(hxc->cfg), NULL);
             }
         }
-        cfg.slot_nr = hxc_cfg.slot_index;
-        if (hxc_cfg.index_mode)
+        cfg.slot_nr = hxc->cfg.slot_index;
+        if (hxc->cfg.index_mode)
             break;
         /* Slot mode: initialise slot map and current slot. */
         if (slot_mode == CFG_READ_SLOT_NR) {
-            cfg.max_slot_nr = hxc_cfg.number_of_slot - 1;
+            cfg.max_slot_nr = hxc->cfg.number_of_slot - 1;
             memset(&cfg.slot_map, 0xff, sizeof(cfg.slot_map));
         }
         /* Slot mode: read current slot file info. */
@@ -1348,30 +1507,31 @@ static void hxc_cfg_update(uint8_t slot_mode)
             slot_from_short_slot(&cfg.slot, &cfg.autoboot);
         } else {
             F_lseek(&fs->file, 1024 + cfg.slot_nr*128);
-            F_read(&fs->file, &v1_slot, sizeof(v1_slot), NULL);
-            memcpy(&v2_slot.type, &v1_slot.name[8], 3);
-            memcpy(&v2_slot.attributes, &v1_slot.attributes, 1+4+4+17);
-            v2_slot.name[17] = '\0';
-            slot_from_short_slot(&cfg.slot, &v2_slot);
+            F_read(&fs->file, &hxc->v1_slot, sizeof(hxc->v1_slot), NULL);
+            memcpy(&hxc->v2_slot.type, &hxc->v1_slot.name[8], 3);
+            memcpy(&hxc->v2_slot.attributes, &hxc->v1_slot.attributes,
+                   1+4+4+17);
+            hxc->v2_slot.name[17] = '\0';
+            slot_from_short_slot(&cfg.slot, &hxc->v2_slot);
         }
         break;
     }
 
     case 2:
         if (slot_mode != CFG_READ_SLOT_NR) {
-            hxc_cfg.cur_slot_number = cfg.slot_nr;
+            hxc->cfg.cur_slot_number = cfg.slot_nr;
             if (slot_mode == CFG_WRITE_SLOT_NR) {
                 F_lseek(&fs->file, 0);
-                F_write(&fs->file, &hxc_cfg, sizeof(hxc_cfg), NULL);
+                F_write(&fs->file, &hxc->cfg, sizeof(hxc->cfg), NULL);
             }
         }
-        cfg.slot_nr = hxc_cfg.cur_slot_number;
-        if (hxc_cfg.index_mode)
+        cfg.slot_nr = hxc->cfg.cur_slot_number;
+        if (hxc->cfg.index_mode)
             break;
         /* Slot mode: initialise slot map and current slot. */
         if (slot_mode == CFG_READ_SLOT_NR) {
-            cfg.max_slot_nr = hxc_cfg.max_slot_number - 1;
-            F_lseek(&fs->file, hxc_cfg.slots_map_position*512);
+            cfg.max_slot_nr = hxc->cfg.max_slot_number - 1;
+            F_lseek(&fs->file, hxc->cfg.slots_map_position*512);
             F_read(&fs->file, &cfg.slot_map, sizeof(cfg.slot_map), NULL);
             cfg.slot_map[0] |= 0x80; /* slot 0 always available */
             /* Find true max_slot_nr: */
@@ -1382,17 +1542,17 @@ static void hxc_cfg_update(uint8_t slot_mode)
         if (cfg.slot_nr == 0) {
             slot_from_short_slot(&cfg.slot, &cfg.autoboot);
         } else {
-            F_lseek(&fs->file, hxc_cfg.slots_position*512
-                    + cfg.slot_nr*64*hxc_cfg.number_of_drive_per_slot);
-            F_read(&fs->file, &v2_slot, sizeof(v2_slot), NULL);
-            slot_from_short_slot(&cfg.slot, &v2_slot);
+            F_lseek(&fs->file, hxc->cfg.slots_position*512
+                    + cfg.slot_nr*64*hxc->cfg.number_of_drive_per_slot);
+            F_read(&fs->file, &hxc->v2_slot, sizeof(hxc->v2_slot), NULL);
+            slot_from_short_slot(&cfg.slot, &hxc->v2_slot);
         }
         break;
 
     default:
     bad_signature:
-        hxc_cfg.signature[15] = '\0';
-        printk("Bad signature '%s'\n", hxc_cfg.signature);
+        hxc->cfg.signature[15] = '\0';
+        printk("Bad signature '%s'\n", hxc->cfg.signature);
         F_die(FR_BAD_HXCSDFE);
 
     }
@@ -1400,7 +1560,7 @@ static void hxc_cfg_update(uint8_t slot_mode)
     F_close(&fs->file);
 
 indexed_mode:
-    if (hxc_cfg.index_mode) {
+    if (hxc->cfg.index_mode) {
 
         char name[16];
 
@@ -1611,16 +1771,17 @@ static int run_floppy(void *_b)
 
 static void floppy_arena_setup(void)
 {
-    unsigned int cache_len;
-    uint8_t *cache_start;
-
     arena_init();
 
     fs = arena_alloc(sizeof(*fs));
 
-    cache_len = arena_avail();
-    cache_start = arena_alloc(cache_len);
-    volume_cache_init(cache_start, cache_start + cache_len);
+    if (cfg.sorted) {
+        native_get_slot_map(FALSE);
+    } else {
+        unsigned int cache_len = arena_avail();
+        uint8_t *cache_start = arena_alloc(0);
+        volume_cache_init(cache_start, cache_start + cache_len);
+    }
 }
 
 static void floppy_arena_teardown(void)
@@ -1638,11 +1799,11 @@ static int floppy_main(void *unused)
 
     /* If any buttons are pressed when USB drive is mounted then we start 
      * in ejected state. */
-    if (buttons)
-        cfg.ejected = TRUE;
+    cfg.ejected = (buttons != 0);
 
+    cfg.sorted = NULL;
     floppy_arena_setup();
-    
+
     cfg_init();
     cfg_update(CFG_READ_SLOT_NR);
 
@@ -1692,6 +1853,7 @@ static int floppy_main(void *unused)
                 cfg.cur_cdir = fatfs.cdir;
                 cfg.slot_nr = 1;
             }
+            cfg.sorted = NULL;
             cfg_update(CFG_READ_SLOT_NR);
             display_write_slot(FALSE);
             b = buttons;
@@ -1715,7 +1877,17 @@ static int floppy_main(void *unused)
             fres = F_call_cancellable(run_floppy, &b);
             floppy_cancel();
             assert_volume_connected();
+            if ((b != 0) && (display_mode == DM_LCD_1602)) {
+                /* Immediate visual indication of button press. */
+                lcd_write(wp_column, 1, 1, "-");
+                lcd_on();
+            }
             floppy_arena_setup();
+        }
+
+        if (cfg.dirty_slot_name) {
+            cfg.dirty_slot_name = FALSE;
+            update_slot_by_name();
         }
 
         if (cfg.dirty_slot_nr) {
