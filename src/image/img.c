@@ -1847,6 +1847,7 @@ static void raw_dump_info(struct image *im)
 {
     struct raw_trk *trk = im->img.trk;
     unsigned int i;
+    if (1) return;
     printk("C%u S%u:: %s %u-%u-%u:\n",
            im->cur_track/2, im->cur_track&1,
            (im->sync == SYNC_fm) ? "FM" : "MFM",
@@ -2114,7 +2115,7 @@ static bool_t mfm_read_track(struct image *im)
     uint8_t *buf = rd->p;
     uint16_t *bc_b = bc->p;
     uint32_t bc_len, bc_mask, bc_space, bc_p, bc_c;
-    uint16_t pr = 0, crc;
+    uint16_t pr, crc;
     unsigned int i;
 
     img_fetch_data(im);
@@ -2126,6 +2127,7 @@ static bool_t mfm_read_track(struct image *im)
     bc_mask = bc_len - 1;
     bc_space = bc_len - (uint16_t)(bc_p - bc_c);
 
+    pr = be16toh(bc_b[(bc_p-1) & bc_mask]);
 #define emit_raw(r) ({                                   \
     uint16_t _r = (r);                                   \
     bc_b[bc_p++ & bc_mask] = htobe16(_r & ~(pr << 15));  \
