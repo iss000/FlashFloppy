@@ -24,6 +24,8 @@
 #define outp_nr     6
 #define outp_unused outp_nr
 
+#define verbose_image_log FALSE
+
 struct adf_image {
     uint32_t trk_off;
     uint16_t trk_pos, trk_len;
@@ -38,6 +40,10 @@ struct hfe_image {
     uint16_t trk_pos, trk_len;
     bool_t is_v3;
     uint8_t batch_secs;
+    struct {
+        uint16_t start;
+        bool_t wrapped;
+    } write;
     struct {
         uint16_t off, len;
         bool_t dirty;
@@ -220,6 +226,9 @@ uint32_t image_ticks_since_index(struct image *im);
 extern const uint16_t mfmtab[];
 static inline uint16_t bintomfm(uint8_t x) { return mfmtab[x]; }
 uint8_t mfmtobin(uint16_t x);
+void mfm_to_bin(const void *in, void *out, unsigned int nr);
+void mfm_ring_to_bin(const uint16_t *ring, unsigned int mask,
+                     unsigned int idx, void *out, unsigned int nr);
 
 /* FM conversion. */
 #define FM_SYNC_CLK 0xc7
@@ -237,6 +246,7 @@ struct track_info {
 };
 void floppy_get_track(struct track_info *ti);
 void floppy_set_fintf_mode(void);
+void floppy_set_motor_delay(void);
 
 /*
  * Local variables:

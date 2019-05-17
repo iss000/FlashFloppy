@@ -849,6 +849,12 @@ static void read_ff_cfg(void)
             ff_cfg.head_settle_ms = strtol(opts.arg, NULL, 10);
             break;
 
+        case FFCFG_motor_delay:
+            ff_cfg.motor_delay =
+                !strcmp(opts.arg, "ignore") ? MOTOR_ignore
+                : (strtol(opts.arg, NULL, 10) + 9) / 10;
+            break;
+
             /* STARTUP / INITIALISATION */
 
         case FFCFG_ejected_on_startup:
@@ -1059,6 +1065,10 @@ static void process_ff_cfg_opts(const struct ff_cfg *old)
         || (ff_cfg.pin02 != old->pin02)
         || (ff_cfg.pin34 != old->pin34))
         floppy_set_fintf_mode();
+
+    /* motor-delay: Inform the floppy subsystem. */
+    if (ff_cfg.motor_delay != old->motor_delay)
+        floppy_set_motor_delay();
 
     /* ejected-on-startup: Set the ejected state appropriately. */
     if (ff_cfg.ejected_on_startup)
@@ -1869,6 +1879,8 @@ static int floppy_main(void *unused)
         printk("Attr: %02x Clus: %08x Size: %u\n",
                cfg.slot.attributes, cfg.slot.firstCluster, cfg.slot.size);
 
+        logfile_flush(&fs->file);
+
         if (cfg.ejected) {
             cfg.ejected = FALSE;
             b = B_SELECT;
@@ -1883,6 +1895,7 @@ static int floppy_main(void *unused)
                 lcd_on();
             }
             floppy_arena_setup();
+            logfile_flush(&fs->file);
         }
 
         if (cfg.dirty_slot_name) {
@@ -2106,13 +2119,22 @@ static void banner(void)
 {
     switch (display_mode) {
     case DM_LED_7SEG:
-        led_7seg_write_string((led_7seg_nr_digits() == 3) ? "F-F" : "FF");
+        led_7seg_write_string(
+#ifdef LOGFILE
+            "LOG"
+#else
+            (led_7seg_nr_digits() == 3) ? "F-F" : "FF"
+#endif
+            );
         break;
     case DM_LCD_1602:
         lcd_clear();
         lcd_write(0, 0, 0, "FlashFloppy");
         lcd_write(0, 1, 0, "v");
         lcd_write(1, 1, 0, fw_ver);
+#ifdef LOGFILE
+        lcd_write(10, 1, 0, "[Log]");
+#endif
         lcd_on();
         break;
     }
