@@ -94,6 +94,11 @@ static void board_floppy_init(void)
         gpio_configure_pin(gpioa, pin_sel1,  GPI_bus);
         gpio_configure_pin(gpioa, pin_motor, GPI_bus);
         afio->exticr4 = 0x0111; /* Motor = PA15 */
+    } else {
+        /* This gives us "motor always on" if the pin is not connected. 
+         * It is safe enough to pull down even if connected direct to 5v, 
+         * will only sink ~0.15mA via the weak internal pulldown. */
+        gpio_configure_pin(gpiob, pin_motor, GPI_pull_down);
     }
 
     exti->imr = exti->rtsr = exti->ftsr =
@@ -342,16 +347,11 @@ static void IRQ_MOTOR_changed(void)
 
 void floppy_set_motor_delay(void)
 {
-    if (!gotek_enhanced())
-        gpio_configure_pin(gpiob, pin_motor,
-                           (ff_cfg.motor_delay == MOTOR_ignore)
-                           ? GPI_pull_up : GPI_bus);
-
-    exti->imr &= ~m(pin_motor);
     if (ff_cfg.motor_delay != MOTOR_ignore) {
         exti->imr |= m(pin_motor);
         printk("Motor: Delay %u ms\n", ff_cfg.motor_delay * 10);
     } else {
+        exti->imr &= ~m(pin_motor);
         printk("Motor: Ignored\n");
     }
 
