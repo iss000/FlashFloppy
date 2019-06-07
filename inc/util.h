@@ -85,6 +85,8 @@ long int strtol(const char *nptr, char **endptr, int base);
 void qsort_p(void *base, unsigned int nr,
              int (*compar)(const void *, const void *));
 
+uint32_t rand(void);
+
 int vsnprintf(char *str, size_t size, const char *format, va_list ap)
     __attribute__ ((format (printf, 3, 0)));
 
@@ -145,7 +147,7 @@ uint16_t crc16_ccitt(const void *buf, size_t len, uint16_t crc);
 void display_init(void);
 extern uint8_t display_mode;
 #define DM_NONE     0
-#define DM_LCD_1602 1
+#define DM_LCD_OLED 1
 #define DM_LED_7SEG 2
 
 /* Speaker. */
@@ -154,6 +156,7 @@ void speaker_pulse(void);
 
 /* Display: 3-digit 7-segment display */
 void led_7seg_init(void);
+void led_7seg_write_raw(const uint8_t *d);
 void led_7seg_write_string(const char *p);
 void led_7seg_write_decimal(unsigned int val);
 void led_7seg_display_setting(bool_t enable);
@@ -192,6 +195,7 @@ extern const char fw_ver[];
 
 /* Text/data/BSS address ranges. */
 extern char _stext[], _etext[];
+extern char _smaintext[], _emaintext[];
 extern char _sdat[], _edat[], _ldat[];
 extern char _sbss[], _ebss[];
 
@@ -215,6 +219,7 @@ void EXC_unused(void);
 #define FLOPPY_SOFTIRQ_PRI    9
 #define I2C_IRQ_PRI          13
 #define USB_IRQ_PRI          14
+#define CONSOLE_IRQ_PRI      15
 
 /*
  * Local variables:
