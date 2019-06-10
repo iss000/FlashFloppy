@@ -869,6 +869,12 @@ static void read_ff_cfg(void)
                 : (strtol(opts.arg, NULL, 10) + 9) / 10;
             break;
 
+        case FFCFG_chgrst:
+            ff_cfg.chgrst =
+                !strcmp(opts.arg, "pa14") ? CHGRST_pa14
+                : CHGRST_step;
+            break;
+
             /* STARTUP / INITIALISATION */
 
         case FFCFG_ejected_on_startup:
@@ -994,6 +1000,8 @@ static void read_ff_cfg(void)
                 } else if (!strncmp(p, "narrow", 6)) {
                     ff_cfg.display_type |=
                         (p[6] == 'e') ? DISPLAY_narrower : DISPLAY_narrow;
+                } else if (!strcmp(p, "ztech")) {
+                    ff_cfg.display_type |= DISPLAY_ztech;
                 } else if ((r = strchr(p, 'x')) != NULL) {
                     unsigned int w, h;
                     *r++ = '\0';
@@ -1086,10 +1094,6 @@ static void process_ff_cfg_opts(const struct ff_cfg *old)
         || (ff_cfg.pin02 != old->pin02)
         || (ff_cfg.pin34 != old->pin34))
         floppy_set_fintf_mode();
-
-    /* motor-delay: Inform the floppy subsystem. */
-    if (ff_cfg.motor_delay != old->motor_delay)
-        floppy_set_motor_delay();
 
     /* ejected-on-startup: Set the ejected state appropriately. */
     if (ff_cfg.ejected_on_startup)
