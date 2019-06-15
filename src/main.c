@@ -123,12 +123,6 @@ static bool_t slot_type(const char *str)
 }
 
 #define wp_column ((lcd_columns > 16) ? 8 : 7)
-static void display_wp_status(void)
-{
-    if (display_mode != DM_LCD_OLED)
-        return;
-    lcd_write(wp_column, 1, 1, (cfg.slot.attributes & AM_RDO) ? "*" : "");
-}
 
 /* Scroll long filename. */
 static struct {
@@ -150,9 +144,18 @@ static void lcd_scroll_init(uint16_t pause, uint16_t rate)
 }
 static void lcd_scroll_name(void)
 {
+    static struct track_info ti;
     char msg[25];
+
     if ((lcd_scroll.ticks > 0) || (lcd_scroll.end == 0))
         return;
+
+    floppy_get_track(&ti);
+    if (ti.cyl >= DA_FIRST_CYL) {
+        /* Display controlled by src/image/da.c */
+        return;
+    }
+
     lcd_scroll.ticks = time_ms(lcd_scroll.rate);
     if (lcd_scroll.pause != 0) {
         if (++lcd_scroll.off > lcd_scroll.end)
@@ -247,11 +250,6 @@ static void lcd_write_track_info(bool_t force)
         return;
 
     floppy_get_track(&ti);
-
-    if (ti.cyl >= DA_FIRST_CYL) {
-        /* Display controlled by src/image/da.c */
-        return;
-    }
 
     if (lcd_columns <= 16)
         ti.cyl = min_t(uint8_t, ti.cyl, 99);
@@ -1027,6 +1025,27 @@ static void read_ff_cfg(void)
         case FFCFG_oled_contrast:
             ff_cfg.oled_contrast = strtol(opts.arg, NULL, 10);
             break;
+
+        case FFCFG_oled_text: {
+            char *p = opts.arg;
+            int sh = 0;
+            ff_cfg.oled_text = OTXT_default;
+            if (!strcmp(p, "default"))
+                break;
+            ff_cfg.oled_text = 0;
+            while (p != NULL) {
+                ff_cfg.oled_text |= ((p[0]-'0')&7) << sh;
+                if (p[1] == 'd')
+                    ff_cfg.oled_text |= OTXT_double << sh;
+                sh += OTXT_shift;
+                if ((p = strchr(p, ',')) == NULL)
+                    break;
+                p++;
+            }
+            if (sh < 16)
+                ff_cfg.oled_text |= 0x7777 << sh;
+            break;
+        }
 
         case FFCFG_display_off_secs:
             ff_cfg.display_off_secs = strtol(opts.arg, NULL, 10);
@@ -1825,10 +1844,343 @@ static void floppy_arena_teardown(void)
     volume_cache_destroy();
 }
 
+static void noinline volume_space(void)
+{
+    char msg[25];
+    unsigned int free = (fatfs.free_clst*fatfs.csize+1953/2)/1953 + 100/2;
+    unsigned int total = (fatfs.n_fatent*fatfs.csize+1953/2)/1953 + 100/2;
+    if (fatfs.free_clst < fatfs.n_fatent-2) {
+        snprintf(msg, sizeof(msg), "Free:%u.%u/%u.%uG",
+                 free/1000, (free%1000)/100,
+                 total/1000, (total%1000)/100);
+    } else {
+        snprintf(msg, sizeof(msg), "Volume: %u.%uG",
+                 total/1000, (total%1000)/100);
+    }
+    lcd_write(0, 2, -1, msg);
+
+}
+
+static uint8_t menu_wait_button(bool_t twobutton_eject, const char *led_msg)
+{
+    unsigned int wait = 0;
+    uint8_t b;
+
+    /* Wait for any button to be pressed. */
+    while ((b = buttons) == 0) {
+        /* Bail if USB disconnects. */
+        assert_volume_connected();
+        /* Update the display. */
+        delay_ms(1);
+        switch (display_mode) {
+        case DM_LED_7SEG:
+            /* Alternate the 7-segment display. */
+            if ((++wait % 1000) == 0) {
+                switch (wait / 1000) {
+                case 1:
+                    led_7seg_write_decimal(cfg.slot_nr);
+                    break;
+                default:
+                    led_7seg_write_string(led_msg);
+                    wait = 0;
+                    break;
+                }
+            }
+            break;
+        case DM_LCD_OLED:
+            /* Continue to scroll long filename. */
+            lcd_scroll.ticks -= time_ms(1);
+            lcd_scroll_name();
+            break;
+        }
+    }
+
+    if (twobutton_eject) {
+        /* Wait 50ms for 2-button press. */
+        for (wait = 0; wait < 50; wait++) {
+            if ((buttons & (B_LEFT|B_RIGHT)) == (B_LEFT|B_RIGHT))
+                b = B_SELECT;
+            if (b & B_SELECT)
+                break;
+            delay_ms(1);
+        }
+    }
+
+    return b;
+}
+
+static uint8_t noinline display_error(FRESULT fres, uint8_t b)
+{
+    bool_t twobutton_eject =
+        (ff_cfg.twobutton_action & TWOBUTTON_mask) == TWOBUTTON_eject;
+    char msg[17];
+
+    switch (display_mode) {
+    case DM_LED_7SEG:
+        snprintf(msg, sizeof(msg), "%c%02u",
+                 (fres >= 30) ? 'E' : 'F', fres);
+        led_7seg_write_string(msg);
+        break;
+    case DM_LCD_OLED:
+        snprintf(msg, sizeof(msg), "*%s*%02u*",
+                 (fres >= 30) ? "ERR" : "FAT", fres);
+        lcd_write(wp_column+1, 1, -1, "");
+        lcd_write((lcd_columns > 16) ? 10 : 8, 1, 0, msg);
+        lcd_on();
+        break;
+    }
+
+    /* Wait for buttons to be released. */
+    while (buttons != 0)
+        continue;
+
+    /* Wait for any button to be pressed. */
+    b = menu_wait_button(twobutton_eject, msg);
+
+    while (b & B_SELECT) {
+        b = buttons;
+        if (twobutton_eject && b) {
+            /* Wait for 2-button release. */
+            b = B_SELECT;
+        }
+    }
+
+    return b;
+}
+
+static void image_clone(void)
+{
+    time_t t;
+    int i, baselen, todo, idx, max_idx = -1;
+    char *p, *q;
+    FIL *nfil;
+
+    strcpy(fs->buf, cfg.slot.name);
+    if ((p = q = strrchr(fs->buf, '_')) != NULL) {
+        for (i = 0; i < 3; i++) {
+            char c = *++p;
+            if ((c < '0') || (c > '9'))
+                break;
+        }
+        p = ((i == 3) && (p[1] == '\0')) ? q : NULL;
+    }
+
+    if (p == NULL)
+        p = fs->buf + strlen(fs->buf);
+
+    baselen = p - fs->buf;
+    snprintf(p, sizeof(fs->buf) - baselen, "_*.%s", cfg.slot.type);
+
+    for (F_findfirst(&fs->dp, &fs->fp, "", fs->buf);
+         fs->fp.fname[0] != '\0';
+         F_findnext(&fs->dp, &fs->fp)) {
+        p = fs->fp.fname + baselen + 1;
+        /* Parse 3-digit index number. */
+        idx = 0;
+        for (i = 0; i < 3; i++) {
+            if ((*p < '0') || (*p > '9'))
+                break;
+            idx *= 10;
+            idx += *p++ - '0';
+        }
+        /* Expect a 3-digit number. */
+        if ((i != 3) || (*p != '.'))
+            continue;
+        max_idx = max_t(int, max_idx, idx);
+    }
+    F_closedir(&fs->dp);
+
+    t = time_now();
+    if (max_idx >= 999) {
+        lcd_write(0, 1, -1, "No spare slots!");
+        goto out;
+    }
+
+    snprintf(fs->buf, sizeof(fs->buf), "Cloning To %03u", max_idx+1);
+    lcd_write(0, 1, -1, fs->buf);
+
+    volume_cache_destroy();
+    fatfs_from_slot(&fs->file, &cfg.slot, FA_READ);
+    nfil = arena_alloc(sizeof(*nfil));
+    strcpy(fs->buf, cfg.slot.name);
+    snprintf(fs->buf + baselen, sizeof(fs->buf) - baselen, "_%03u.%s",
+             max_idx+1, cfg.slot.type);
+    F_open(nfil, fs->buf, FA_CREATE_NEW|FA_WRITE);
+    todo = f_size(&fs->file); 
+    while (todo != 0) {
+        int nr = min_t(int, todo, arena_avail());
+        void *p = arena_alloc(0);
+        F_read(&fs->file, p, nr, NULL);
+        F_write(nfil, p, nr, NULL);
+        todo -= nr;
+    }
+    F_close(nfil);
+    floppy_arena_setup();
+    if (!cfg.sorted)
+        cfg_update(CFG_READ_SLOT_NR);
+
+out:
+    delay_from(t, time_ms(2000));
+}
+
+static bool_t image_delete(void)
+{
+    FRESULT fres;
+    time_t t = time_now();
+    bool_t ok = FALSE;
+
+    if (cfg.hxc_mode) {
+        lcd_write(0, 1, -1, "Native Mode Only");
+        goto out;
+    }
+
+    lcd_write(0, 1, -1, "Deleting...");
+
+    snprintf(fs->buf, sizeof(fs->buf), "%s.%s",
+             cfg.slot.name, cfg.slot.type);
+    fres = f_unlink(fs->buf);
+    if (fres != FR_OK) {
+        snprintf(fs->buf, sizeof(fs->buf), "Failed (%d)", fres);
+        t = time_now();
+    }
+
+    cfg.slot_nr = min_t(uint16_t, cfg.slot_nr, cfg.max_slot_nr-1);
+    cfg.sorted = NULL;
+    cfg_update(CFG_READ_SLOT_NR);
+    ok = TRUE;
+
+out:
+    delay_from(t, time_ms(2000));
+    return ok;
+}
+
+static uint8_t noinline eject_menu(uint8_t b)
+{
+    const static char *menu[] = {
+        "**Eject Menu**",
+        NULL,
+        "Clone Image",
+        "Delete Image",
+        "Exit to Selector",
+        "Exit & Re-Insert",
+    };
+
+    char msg[17];
+    unsigned int wait;
+    int sel = 0;
+    bool_t twobutton_eject =
+        ((ff_cfg.twobutton_action & TWOBUTTON_mask) == TWOBUTTON_eject)
+        || (display_mode == DM_LCD_OLED); /* or two buttons can't exit menu */
+
+    ima_mark_ejected(TRUE);
+
+    for (;;) {
+
+        if (sel < 0)
+            sel += ARRAY_SIZE(menu);
+        if (sel >= ARRAY_SIZE(menu))
+            sel -= ARRAY_SIZE(menu);
+
+        switch (display_mode) {
+        case DM_LED_7SEG:
+            led_7seg_write_string("EJE");
+            break;
+        case DM_LCD_OLED:
+            switch (sel) {
+            case 1: /* W.Protect */
+                snprintf(msg, sizeof(msg), "Write Prot.: O%s",
+                         (cfg.slot.attributes & AM_RDO) ? "N" : "FF");
+                lcd_write(0, 1, -1, msg);
+                break;
+            default:
+                lcd_write(0, 1, -1, menu[sel]);
+                break;
+            }
+            lcd_on();
+            break;
+        }
+
+        /* Wait for buttons to be released. */
+        wait = 0;
+        while (buttons != 0) {
+            delay_ms(1);
+            if ((display_mode != DM_LCD_OLED) && (wait++ >= 2000)) {
+            toggle_wp:
+                wait = 0;
+                cfg.slot.attributes ^= AM_RDO;
+                if (volume_readonly()) {
+                    /* Read-only filesystem: force AM_RDO always. */
+                    cfg.slot.attributes |= AM_RDO;
+                }
+                if (display_mode == DM_LED_7SEG)
+                    led_7seg_write_string((cfg.slot.attributes & AM_RDO)
+                                          ? "RDO" : "RIT");
+            }
+        }
+
+        /* Wait for any button to be pressed. */
+        b = menu_wait_button(twobutton_eject, "EJE");
+
+        if (b & B_LEFT)
+            sel--;
+        if (b & B_RIGHT)
+            sel++;
+        if ((sel != 0) && (display_mode != DM_LCD_OLED))
+            goto out;
+
+        /* Reload same image immediately if eject pressed again. */
+        if (b & B_SELECT) {
+            /* Wait for eject button to be released. */
+            wait = 0;
+            while (b & B_SELECT) {
+                b = buttons;
+                if (twobutton_eject && b) {
+                    /* Wait for 2-button release. */
+                    b = B_SELECT;
+                }
+                delay_ms(1);
+                if ((display_mode != DM_LCD_OLED) && (wait++ >= 2000))
+                    goto toggle_wp;
+            }
+            /* LED display: No menu, we exit straight out. */
+            if (display_mode != DM_LCD_OLED)
+                goto out;
+            switch (sel) {
+            case 1: /* Toggle W.Protect */
+                cfg.slot.attributes ^= AM_RDO;
+                if (volume_readonly()) {
+                    /* Read-only filesystem: force AM_RDO always. */
+                    cfg.slot.attributes |= AM_RDO;
+                }
+                break;
+            case 2: /* Clone Image */
+                image_clone();
+                break;
+            case 3: /* Delete Image */
+                if (!image_delete())
+                    break;
+                b = 0xff; /* selector */
+                goto out;
+            case 4: /* Exit & Select */
+                display_write_slot(TRUE);
+                b = 0xff; /* selector */
+                goto out;
+            case 0: case 5: /* Exit & Re-Insert */
+                b = 0;
+                goto out;
+            }
+        }
+ 
+    }
+
+out:
+    ima_mark_ejected(FALSE);
+    return b;
+}
+
 static int floppy_main(void *unused)
 {
     FRESULT fres;
-    char msg[17];
     uint8_t b;
     uint32_t i;
 
@@ -1850,6 +2202,8 @@ static int floppy_main(void *unused)
     }
 
     for (;;) {
+
+        volume_space();
 
         lcd_scroll.ticks = time_ms(ff_cfg.display_scroll_pause)
             ?: time_ms(ff_cfg.display_scroll_rate);
@@ -1921,6 +2275,7 @@ static int floppy_main(void *unused)
             }
             floppy_arena_setup();
             logfile_flush(&fs->file);
+            volume_space();
         }
 
         if (cfg.dirty_slot_name) {
@@ -1935,107 +2290,20 @@ static int floppy_main(void *unused)
             cfg_update(CFG_WRITE_SLOT_NR);
         }
 
-        /* When an image is loaded, select button means eject. */
-        if (fres || (b & B_SELECT)) {
-            /* ** EJECT STATE ** */
-            unsigned int wait;
-            bool_t twobutton_eject =
-                (ff_cfg.twobutton_action & TWOBUTTON_mask) == TWOBUTTON_eject;
-            snprintf(msg, sizeof(msg), "EJECTED");
-            switch (display_mode) {
-            case DM_LED_7SEG:
-                if (fres)
-                    snprintf(msg, sizeof(msg), "%c%02u",
-                             (fres >= 30) ? 'E' : 'F', fres);
-                led_7seg_write_string(msg);
-                break;
-            case DM_LCD_OLED:
-                if (fres)
-                    snprintf(msg, sizeof(msg), "*%s*%02u*",
-                             (fres >= 30) ? "ERR" : "FAT", fres);
-                display_wp_status();
-                lcd_write(wp_column+1, 1, -1, "");
-                lcd_write((lcd_columns > 16) ? 10 : 8, 1, 0, msg);
-                lcd_on();
-                break;
-            }
-            if (fres == FR_OK)
-                ima_mark_ejected(TRUE);
+        if (fres) {
+            b = display_error(fres, b);
             fres = FR_OK;
-            /* Wait for buttons to be released. */
-            wait = 0;
-            while (buttons != 0) {
-                delay_ms(1);
-                if (wait++ >= 2000) {
-                toggle_wp:
-                    wait = 0;
-                    cfg.slot.attributes ^= AM_RDO;
-                    if (volume_readonly()) {
-                        /* Read-only filesystem: force AM_RDO always. */
-                        cfg.slot.attributes |= AM_RDO;
-                    }
-                    display_wp_status();
-                    if (display_mode == DM_LED_7SEG)
-                        led_7seg_write_string((cfg.slot.attributes & AM_RDO)
-                                              ? "RDO" : "RIT");
-                }
-            }
-            /* Wait for any button to be pressed. */
-            wait = 0;
-            while ((b = buttons) == 0) {
-                /* Bail if USB disconnects. */
-                assert_volume_connected();
-                /* Update the display. */
-                delay_ms(1);
-                switch (display_mode) {
-                case DM_LED_7SEG:
-                    /* Alternate the 7-segment display. */
-                    if ((++wait % 1000) == 0) {
-                        switch (wait / 1000) {
-                        case 1:
-                            led_7seg_write_decimal(cfg.slot_nr);
-                            break;
-                        default:
-                            led_7seg_write_string(msg);
-                            wait = 0;
-                            break;
-                        }
-                    }
-                    break;
-                case DM_LCD_OLED:
-                    /* Continue to scroll long filename. */
-                    lcd_scroll.ticks -= time_ms(1);
-                    lcd_scroll_name();
-                    break;
-                }
-            }
-            if (twobutton_eject) {
-                /* Wait 50ms for 2-button press. */
-                for (wait = 0; wait < 50; wait++) {
-                    b = buttons;
-                    if ((b & (B_LEFT|B_RIGHT)) == (B_LEFT|B_RIGHT))
-                        b = B_SELECT;
-                    if (b & B_SELECT)
-                        break;
-                    delay_ms(1);
-                }
-            }
-            /* Reload same image immediately if eject pressed again. */
-            if (b & B_SELECT) {
-                /* Wait for eject button to be released. */
-                wait = 0;
-                while (b & B_SELECT) {
-                    b = buttons;
-                    if (twobutton_eject && b) {
-                        /* Wait for 2-button release. */
-                        b = B_SELECT;
-                    }
-                    delay_ms(1);
-                    if (wait++ >= 2000)
-                        goto toggle_wp;
-                }
-                ima_mark_ejected(FALSE);
+            if (b == 0)
                 continue;
+        }
+
+        if (b & B_SELECT) {
+            b = eject_menu(b);
+            if (b == 0)
+                continue;
+            if (b == 0xff) {
+                b = 0;
+                goto select;
             }
         }
 
@@ -2084,10 +2352,13 @@ static int floppy_main(void *unused)
             }
 
             /* Wait for select button to be released. */
-            while ((b = buttons) & B_SELECT)
-                continue;
+            for (i = 0; !cfg.ejected && ((b = buttons) & B_SELECT); i++) {
+                delay_ms(1);
+                if (i >= 2000)
+                    cfg.ejected = TRUE;
+            }
 
-        } while (b != 0);
+        } while (!cfg.ejected && (b != 0));
 
         /* Write the slot number resulting from the latest round of button 
          * presses back to the config file. */
