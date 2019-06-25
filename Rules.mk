@@ -9,7 +9,7 @@ ifneq ($(VERBOSE),1)
 TOOL_PREFIX := @$(TOOL_PREFIX)
 endif
 
-FLAGS  = -g -Os -nostdlib -std=gnu99 -iquote $(ROOT)/inc -I/usr/include
+FLAGS  = -g -Os -nostdlib -std=gnu99 -iquote $(ROOT)/inc -I /usr/include
 FLAGS += -Wall -Werror -Wno-format -Wdeclaration-after-statement
 FLAGS += -Wstrict-prototypes -Wredundant-decls -Wnested-externs
 FLAGS += -fno-common -fno-exceptions -fno-strict-aliasing

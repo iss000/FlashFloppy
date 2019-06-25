@@ -38,19 +38,20 @@ def main(argv):
                         h = int(size.group(2))
                         if w == 128 and h == 64:
                             opts += ['DISPLAY_oled_64']
-                        elif h == 2 and w >= 16 and w <= 40:
+                        elif h >= 2 and h <= 4 and w >= 16 and w <= 40:
                             opts += ['DISPLAY_lcd_columns(%d)' % w]
+                            opts += ['DISPLAY_lcd_rows(%d)' % h]
                     else:
                         opts += ['DISPLAY_' + x]
                 val = '|'.join(opts)
-            elif opt == "oled-text":
+            elif opt == "display-order":
                 if val == "default":
-                    val = "OTXT_" + val
+                    val = "DORD_" + val
                 else:
                     v = 0
                     sh = 0
                     for x in val.split(","):
-                        o = re.match("([0-9])([sd])", x)
+                        o = re.match("([0-9])(d?)", x)
                         v |= int(o.group(1)) << sh
                         if o.group(2) == "d":
                             v |= 8 << sh

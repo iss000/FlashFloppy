@@ -441,9 +441,32 @@ static void button_timer_fn(void *unused)
 
     rotary = ((rotary << 2) | ((gpioc->idr >> 10) & 3)) & 15;
     switch (ff_cfg.rotary & ~ROT_reverse) {
-    case ROT_trackball:
+    case ROT_trackball: {
+        static uint8_t count, thresh, dir;
         rb = rotary_reverse[(rotary ^ (rotary >> 2)) & 3];
+        if (rb == 0) {
+            /* Idle: Increase threshold, decay the counter. */
+            if (thresh < 72) thresh++;
+            if (count) count--;
+        } else if (rb != dir) {
+            /* Change of direction: Put the brakes on. */
+            dir = rb;
+            count = rb = 0;
+            thresh = 72;
+        } else {
+            /* Step in same direction: Increase count, decay the threshold. */
+            count += 32;
+            thresh = max_t(int, 0, thresh - 8);
+            if (count >= thresh) {
+                /* Count exceeds threshold: register a press. */
+                count = 0;
+            } else {
+                /* Don't register a press yet. */
+                rb = 0;
+            }
+        }
         break;
+    }
     case ROT_buttons:
         rb = rotary_reverse[rotary & 3];
         break;
@@ -1010,6 +1033,7 @@ static void read_ff_cfg(void)
                             ff_cfg.display_type |= DISPLAY_oled_64;
                     } else if (ff_cfg.display_type & DISPLAY_lcd) {
                         ff_cfg.display_type |= DISPLAY_lcd_columns(w);
+                        ff_cfg.display_type |= DISPLAY_lcd_rows(h);
                     }
                 }
             }
@@ -1026,24 +1050,24 @@ static void read_ff_cfg(void)
             ff_cfg.oled_contrast = strtol(opts.arg, NULL, 10);
             break;
 
-        case FFCFG_oled_text: {
+        case FFCFG_display_order: {
             char *p = opts.arg;
             int sh = 0;
-            ff_cfg.oled_text = OTXT_default;
+            ff_cfg.display_order = DORD_default;
             if (!strcmp(p, "default"))
                 break;
-            ff_cfg.oled_text = 0;
+            ff_cfg.display_order = 0;
             while (p != NULL) {
-                ff_cfg.oled_text |= ((p[0]-'0')&7) << sh;
+                ff_cfg.display_order |= ((p[0]-'0')&7) << sh;
                 if (p[1] == 'd')
-                    ff_cfg.oled_text |= OTXT_double << sh;
-                sh += OTXT_shift;
+                    ff_cfg.display_order |= DORD_double << sh;
+                sh += DORD_shift;
                 if ((p = strchr(p, ',')) == NULL)
                     break;
                 p++;
             }
             if (sh < 16)
-                ff_cfg.oled_text |= 0x7777 << sh;
+                ff_cfg.display_order |= 0x7777 << sh;
             break;
         }
 
@@ -1217,6 +1241,7 @@ native_mode:
     /* Process IMAGE_A.CFG file. */
     sofar = 0; /* bytes consumed so far */
     fatfs.cdir = cfg.cur_cdir;
+    lcd_write(0, 3, -1, "/");
     for (;;) {
         int nr;
         bool_t ok;
@@ -1231,6 +1256,7 @@ native_mode:
         /* Terminate the name section, push curdir onto stack, then chdir. */
         *p++ = '\0';
         printk("%u:D: '%s'\n", cfg.depth, fs->buf);
+        lcd_write(0, 3, -1, fs->buf);
         if (cfg.depth == ARRAY_SIZE(cfg.stack))
             F_die(FR_PATH_TOO_DEEP);
         /* Find slot nr, and stack it */
@@ -1311,6 +1337,7 @@ clear_image_a:
     printk("IMAGE_A.CFG is bad: %sring it\n",
            (ff_cfg.image_on_startup == IMGS_last) ? "clea" : "igno");
     F_lseek(&fs->file, 0);
+    lcd_write(0, 3, -1, "/");
     if (ff_cfg.image_on_startup == IMGS_last)
         F_truncate(&fs->file);
     F_close(&fs->file);
@@ -1384,15 +1411,18 @@ static void native_update(uint8_t slot_mode)
                 if (!p) F_die(FR_BAD_IMAGECFG); /* must exist */
                 *p = '\0';
                 if ((q = strrchr(fs->buf, '/')) != NULL) {
+                    lcd_write(0, 3, -1, q+1);
                     F_lseek(&fs->file, f_tell(&fs->file) - (p-q));
                 } else {
                     F_lseek(&fs->file, 0);
+                    lcd_write(0, 3, -1, "/");
                 }
             } else {
                 /* Add name plus '/' */
                 F_write(&fs->file, fs->fp.fname,
                         strnlen(fs->fp.fname, sizeof(fs->fp.fname)), NULL);
                 F_write(&fs->file, "/", 1, NULL);
+                lcd_write(0, 3, -1, fs->fp.fname);
             }
         } else {
             /* Add name */
@@ -1915,6 +1945,8 @@ static uint8_t noinline display_error(FRESULT fres, uint8_t b)
         (ff_cfg.twobutton_action & TWOBUTTON_mask) == TWOBUTTON_eject;
     char msg[17];
 
+    menu_mode = TRUE;
+
     switch (display_mode) {
     case DM_LED_7SEG:
         snprintf(msg, sizeof(msg), "%c%02u",
@@ -1945,7 +1977,22 @@ static uint8_t noinline display_error(FRESULT fres, uint8_t b)
         }
     }
 
+    menu_mode = FALSE;
     return b;
+}
+
+static bool_t confirm(const char *op)
+{
+    char msg[17];
+    uint8_t b;
+
+    snprintf(msg, sizeof(msg), "Confirm %s?", op);
+    lcd_write(0, 1, -1, msg);
+
+    while ((b = buttons) == 0)
+        continue;
+
+    return (b == B_SELECT);
 }
 
 static void image_clone(void)
@@ -1954,6 +2001,9 @@ static void image_clone(void)
     int i, baselen, todo, idx, max_idx = -1;
     char *p, *q;
     FIL *nfil;
+
+    if (!confirm("Clone"))
+        return;
 
     strcpy(fs->buf, cfg.slot.name);
     if ((p = q = strrchr(fs->buf, '_')) != NULL) {
@@ -2029,6 +2079,9 @@ static bool_t image_delete(void)
     time_t t = time_now();
     bool_t ok = FALSE;
 
+    if (!confirm("Delete"))
+        return FALSE;
+
     if (cfg.hxc_mode) {
         lcd_write(0, 1, -1, "Native Mode Only");
         goto out;
@@ -2071,6 +2124,8 @@ static uint8_t noinline eject_menu(uint8_t b)
     bool_t twobutton_eject =
         ((ff_cfg.twobutton_action & TWOBUTTON_mask) == TWOBUTTON_eject)
         || (display_mode == DM_LCD_OLED); /* or two buttons can't exit menu */
+
+    menu_mode = TRUE;
 
     ima_mark_ejected(TRUE);
 
@@ -2128,7 +2183,6 @@ static uint8_t noinline eject_menu(uint8_t b)
         if ((sel != 0) && (display_mode != DM_LCD_OLED))
             goto out;
 
-        /* Reload same image immediately if eject pressed again. */
         if (b & B_SELECT) {
             /* Wait for eject button to be released. */
             wait = 0;
@@ -2175,6 +2229,7 @@ static uint8_t noinline eject_menu(uint8_t b)
 
 out:
     ima_mark_ejected(FALSE);
+    menu_mode = FALSE;
     return b;
 }
 
@@ -2302,6 +2357,7 @@ static int floppy_main(void *unused)
             if (b == 0)
                 continue;
             if (b == 0xff) {
+                display_write_slot(FALSE);
                 b = 0;
                 goto select;
             }
