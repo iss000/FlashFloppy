@@ -9,7 +9,7 @@ ifneq ($(VERBOSE),1)
 TOOL_PREFIX := @$(TOOL_PREFIX)
 endif
 
-FLAGS  = -g -Os -nostdlib -std=gnu99 -iquote $(ROOT)/inc -I /usr/include
+FLAGS  = -g -Os -nostdlib -std=gnu99 -iquote $(ROOT)/inc -I/usr/include -Wno-stringop-overflow
 FLAGS += -Wall -Werror -Wno-format -Wdeclaration-after-statement
 FLAGS += -Wstrict-prototypes -Wredundant-decls -Wnested-externs
 FLAGS += -fno-common -fno-exceptions -fno-strict-aliasing
@@ -25,6 +25,13 @@ ifeq ($(bootloader),y)
 FLAGS += -DBOOTLOADER=1
 else ifeq ($(logfile),y)
 FLAGS += -DLOGFILE=1
+endif
+
+ifeq ($(quickdisk),y)
+FLAGS += -DQUICKDISK=1
+floppy=n
+else
+floppy=y
 endif
 
 FLAGS += -MMD -MF .$(@F).d

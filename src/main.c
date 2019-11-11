@@ -2601,8 +2601,10 @@ static void banner(void)
     switch (display_mode) {
     case DM_LED_7SEG:
         led_7seg_write_string(
-#ifdef LOGFILE
+#if defined(LOGFILE)
             "LOG"
+#elif defined(QUICKDISK)
+            (led_7seg_nr_digits() == 3) ? "Q-D" : "QD"
 #else
             (led_7seg_nr_digits() == 3) ? "F-F" : "FF"
 #endif
@@ -2613,8 +2615,10 @@ static void banner(void)
         lcd_write(0, 0, 0, "FlashFloppy");
         lcd_write(0, 1, 0, "v");
         lcd_write(1, 1, 0, fw_ver);
-#ifdef LOGFILE
+#if defined(LOGFILE)
         lcd_write(10, 1, 0, "[Log]");
+#elif defined(QUICKDISK)
+        lcd_write(10, 1, 0, "[QD]");
 #endif
         lcd_on();
         break;
@@ -2745,6 +2749,7 @@ int main(void)
     printk("** Keir Fraser <keir.xen@gmail.com>\n");
     printk("** https://github.com/keirf/FlashFloppy\n\n");
 
+    printk("Build: %s %s\n", build_date, build_time);
     printk("Board: %s\n", board_name[board_id]);
 
     speaker_init();
