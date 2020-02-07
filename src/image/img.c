@@ -24,9 +24,9 @@ static void check_p(void *p, struct image *im);
 
 #define SIMPLE_EMPTY_TRK 2 /* if has_empty */
 const static struct simple_layout {
-    uint16_t nr_sectors;
+    uint16_t nr_sectors, rpm;
     uint8_t is_fm, has_iam, has_empty, no, gap3, gap4a, base[2];
-} dfl_simple_layout = { 0, FALSE, TRUE, FALSE, ~0, 0, 0, { 1, 1 } };
+} dfl_simple_layout = { 0, 300, FALSE, TRUE, FALSE, ~0, 0, 0, { 1, 1 } };
 static void simple_layout(
     struct image *im, const struct simple_layout *layout);
 
@@ -34,6 +34,7 @@ static struct raw_trk *add_track_layout(
     struct image *im, unsigned int nr_sectors, unsigned int trk_idx);
 static uint8_t *add_track_map(struct image *im);
 
+static bool_t ibm_3174_open(struct image *im);
 static bool_t msx_open(struct image *im);
 static bool_t pc_dos_open(struct image *im);
 static bool_t ti99_open(struct image *im);
@@ -208,8 +209,8 @@ found:
     im->img.interleave = type->interleave;
     im->img.hskew = type->hskew;
     im->img.cskew = type->cskew;
-    im->img.rpm = (type->rpm + 5) * 60;
 
+    layout.rpm = (type->rpm + 5) * 60;
     layout.has_iam = type->has_iam;
     layout.nr_sectors = type->nr_secs;
     layout.no = type->no;
@@ -347,7 +348,7 @@ static bool_t tag_open(struct image *im, char *tag)
             im->img.hskew = strtol(opts.arg, NULL, 10);
             break;
         case IMGCFG_rpm:
-            im->img.rpm = strtol(opts.arg, NULL, 10);
+            layout.rpm = strtol(opts.arg, NULL, 10);
             break;
         case IMGCFG_gap3:
             layout.gap3 = strtol(opts.arg, NULL, 10);
@@ -417,6 +418,8 @@ static bool_t img_open(struct image *im)
     case HOST_fluke:
         type = fluke_type;
         break;
+    case HOST_ibm_3174:
+        return ibm_3174_open(im);
     case HOST_kaypro:
         type = kaypro_type;
         break;
@@ -547,6 +550,68 @@ static bool_t atr_open(struct image *im)
     return raw_open(im);
 }
 
+static bool_t ibm_3174_open(struct image *im)
+{
+    struct raw_sec *sec;
+    struct raw_trk *trk;
+    uint8_t *trk_map;
+    unsigned int i, j;
+
+    /* Identify image type (1.2MB vs 2.4MB) */
+    /* Both are 512 bytes/sector, 500kHZ data rate */
+    switch (im_size(im)) {
+    case 1228800:
+        /* 1.2MB High density */
+        /* 80 cylinders, 15 sectors/track, 360 rpm */
+        /* Use the default handler */
+        return raw_type_open(im, img_type);
+    case 2442240:
+        /* 2.4MB Extended density */
+        /* 1 cylinder, 15 sectors/track, 360 rpm */
+        /* 79 cylinders, 30 sectors/track, 180 rpm */
+        break;
+    default:
+        /* No other disk formats are valid on the IBM 3174. */
+        return FALSE;
+    }
+
+    im->nr_cyls = 80;
+    im->nr_sides = 2;
+    im->img.interleave = 1;
+    im->img.hskew = 0;
+    im->img.cskew = 0;
+
+    /* Create two track layouts. */
+    /*   0 = 15 sectors/track, 360 rpm */
+    /*   1 = 30 sectors/track, 180 rpm */
+    for (i = 0; i < 2; i++) {
+        unsigned int nr_sectors = (i == 0) ? 15 : 30;
+        trk = add_track_layout(im, nr_sectors, i);
+        trk->is_fm = FALSE;
+        trk->has_iam = TRUE;
+        trk->gap_3 = 104;
+        trk->gap_4a = 0;
+        trk->rpm = (i == 0) ? 360 : 180;
+        sec = &im->img.sec_info_base[trk->sec_off];
+        for (j = 0; j < nr_sectors; j++) {
+            sec->id = j + 1;
+            sec->no = 2;
+            sec++;
+        }
+    }
+
+    /* Create track map, mapping each track to its respective layout. */
+    trk_map = add_track_map(im);
+    for (i = 0; i < im->nr_cyls; i++) {
+        for (j = 0; j < im->nr_sides; j++) {
+            /* Cylinder 0 uses layout 0. */
+            *trk_map++ = (i == 0) ? 0 : 1;
+        }
+    }
+
+    return raw_open(im);
+}
+
 static bool_t d81_open(struct image *im)
 {
     im->img.layout = LAYOUT_sides_swapped;
@@ -607,10 +672,10 @@ static bool_t pc98fdi_open(struct image *im)
     struct simple_layout layout = dfl_simple_layout;
     F_read(&im->fp, &header, sizeof(header), NULL);
     if (le32toh(header.density) == 0x30) {
-        im->img.rpm = 300;
+        layout.rpm = 300;
         layout.gap3 = 84;
     } else {
-        im->img.rpm = 360;
+        layout.rpm = 360;
         layout.gap3 = 116;
     }
     layout.no = (le32toh(header.sector_size_bytes) == 512) ? 2 : 3;
@@ -1526,6 +1591,9 @@ static void raw_seek_track(
     im->img.trk = trk;
     im->img.sec_info = &im->img.sec_info_base[trk->sec_off];
 
+    trk->rpm = trk->rpm ?: 300;
+    im->stk_per_rev = (stk_ms(200) * 300) / trk->rpm;
+
     if (trk->nr_sectors != 0) {
         /* Create logical sector map in rotational order. */
         memset(im->img.sec_map, 0xff, trk->nr_sectors);
@@ -1669,9 +1737,6 @@ static void raw_setup_track(
 
 static bool_t raw_open(struct image *im)
 {
-    im->img.rpm = im->img.rpm ?: 300;
-    im->stk_per_rev = (stk_ms(200) * 300) / im->img.rpm;
-
     volume_cache_init(im->bufs.write_data.p + 1024,
                       im->img.heap_bottom);
 
@@ -1888,7 +1953,7 @@ static void raw_dump_info(struct image *im)
            (im->sync == SYNC_fm) ? "FM" : "MFM",
            im->nr_cyls, im->nr_sides, trk->nr_sectors);
     printk(" rpm: %u, tracklen: %u, datarate: %u\n",
-           im->img.rpm, im->tracklen_bc, trk->data_rate);
+           trk->rpm, im->tracklen_bc, trk->data_rate);
     printk(" gap2: %u, gap3: %u, gap4a: %u, gap4: %u\n",
            trk->gap_2, trk->gap_3, trk->gap_4a, im->img.gap_4);
     printk(" ticks_per_cell: %u, write_bc_ticks: %u, has_iam: %u\n",
@@ -2031,6 +2096,7 @@ static void simple_layout(struct image *im, const struct simple_layout *layout)
     for (i = 0; i < im->nr_sides; i++) {
         trk = add_track_layout(im, layout->nr_sectors, i);
         trk->is_fm = layout->is_fm;
+        trk->rpm = layout->rpm;
         trk->has_iam = layout->has_iam;
         trk->gap_3 = layout->gap3;
         trk->gap_4a = layout->gap4a;
@@ -2044,7 +2110,9 @@ static void simple_layout(struct image *im, const struct simple_layout *layout)
 
     if (layout->has_empty) {
         /* Add an empty track layout. */
-        add_track_layout(im, 0, i);
+        trk = add_track_layout(im, 0, i);
+        trk->is_fm = layout->is_fm;
+        trk->rpm = layout->rpm;
     }
 
     /* Create track map, mapping each side to its respective layout. */
@@ -2099,7 +2167,7 @@ static void mfm_prep_track(struct image *im)
     if (trk->data_rate == 0) {
         /* Infer the data rate. */
         for (i = 1; i < 3; i++) { /* DD=1, HD=2, ED=3 */
-            uint32_t maxlen = (((50000u * 300) / im->img.rpm) << i) + 5000;
+            uint32_t maxlen = (((50000u * 300) / trk->rpm) << i) + 5000;
             if (tracklen < maxlen)
                 break;
         }
@@ -2107,7 +2175,7 @@ static void mfm_prep_track(struct image *im)
     }
 
     /* Calculate standard track length from data rate and RPM. */
-    im->tracklen_bc = (trk->data_rate * 400 * 300) / im->img.rpm;
+    im->tracklen_bc = (trk->data_rate * 400 * 300) / trk->rpm;
 
     /* Calculate a suitable GAP3 if not specified. */
     if ((trk->nr_sectors != 0) && (gap_3 == 0)) {
@@ -2321,7 +2389,7 @@ static void fm_prep_track(struct image *im)
 
     /* Calculate data rate and track length. */
     trk->data_rate = trk->data_rate ?: 125; /* SD */
-    im->tracklen_bc = (trk->data_rate * 400 * 300) / im->img.rpm;
+    im->tracklen_bc = (trk->data_rate * 400 * 300) / trk->rpm;
 
     /* Calculate a suitable GAP3 if not specified. */
     if ((trk->nr_sectors != 0) && (trk->gap_3 == 0)) {
