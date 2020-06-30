@@ -267,9 +267,11 @@ static void lcd_write_track_info(bool_t force)
                  (cfg.slot.attributes & AM_RDO) ? '*' : ti.writing ? 'W' : ' ',
                  ti.cyl, ti.side);
         lcd_write(wp_column, 1, -1, msg);
-        if (ff_cfg.display_on_activity)
+        if (ff_cfg.display_on_activity != DISPON_no)
             lcd_on();
         lcd_ti = ti;
+    } else if ((ff_cfg.display_on_activity == DISPON_sel) && ti.sel) {
+        lcd_on();
     }
 }
 
@@ -930,6 +932,13 @@ static void read_ff_cfg(void)
                 : TRKCHG_instant;
             break;
 
+        case FFCFG_write_drain:
+            ff_cfg.write_drain =
+                !strcmp(opts.arg, "realtime") ? WDRAIN_realtime
+                : !strcmp(opts.arg, "eot") ? WDRAIN_eot
+                : WDRAIN_instant;
+            break;
+
         case FFCFG_index_suppression:
             ff_cfg.index_suppression = !strcmp(opts.arg, "yes");
             break;
@@ -1133,7 +1142,10 @@ static void read_ff_cfg(void)
             break;
 
         case FFCFG_display_on_activity:
-            ff_cfg.display_on_activity = !strcmp(opts.arg, "yes");
+            ff_cfg.display_on_activity =
+                !strcmp(opts.arg, "no") ? DISPON_no
+                : !strcmp(opts.arg, "sel") ? DISPON_sel
+                : DISPON_yes;
             break;
 
         case FFCFG_display_scroll_rate:

@@ -25,6 +25,8 @@ def main(argv):
                 val = "PIN_" + val
             elif opt == "track-change":
                 val = "TRKCHG_" + val
+            elif opt == "write-drain":
+                val = "WDRAIN_" + val
             elif opt == "host":
                 val = "HOST_" + val
             elif opt == "oled-font":
@@ -78,6 +80,8 @@ def main(argv):
                 val = "SORT_" + val
             elif opt == "sort-priority":
                 val = "SORTPRI_" + val
+            elif opt == "display-on-activity":
+                val = "DISPON_" + val
             elif opt == "motor-delay":
                 if val == 'ignore':
                     val = "MOTOR_" + val
