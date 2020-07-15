@@ -177,14 +177,14 @@ void floppy_cancel(void)
     /* Clear soft state. */
     timer_cancel(&drv->chgrst_timer);
     timer_cancel(&index.timer);
-    barrier(); /* cancel index.timer /then/ clear soft state */
-    drv->index_suppressed = FALSE;
-    drv->image = NULL;
-    drv->inserted = FALSE;
-    image = NULL;
+    barrier(); /* cancel index.timer /then/ clear dma rings */
     dma_rd = dma_wr = NULL;
+    barrier(); /* /then/ clear soft state */
+    drv->index_suppressed = FALSE;
+    drv->image = image = NULL;
+    drv->inserted = FALSE;
     index.fake_fired = FALSE;
-    barrier(); /* clear soft state /then/ cancel index.timer_deassert */
+    barrier(); /* /then/ cancel index.timer_deassert */
     timer_cancel(&index.timer_deassert);
     motor_chgrst_eject(drv);
 
@@ -510,10 +510,11 @@ void floppy_set_cyl(uint8_t unit, uint8_t cyl)
 
 void floppy_get_track(struct track_info *ti)
 {
+    bool_t active = dma_wr != NULL;
     ti->cyl = drive.cyl;
-    ti->side = drive.head & (drive.nr_sides - 1);
+    ti->side = active ? drive.head & (drive.image->nr_sides - 1) : 0;
     ti->sel = drive.sel;
-    ti->writing = (dma_wr && dma_wr->state != DMA_inactive);
+    ti->writing = (active && dma_wr->state != DMA_inactive);
 }
 
 static bool_t index_is_suppressed(struct drive *drv)

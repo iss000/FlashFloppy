@@ -49,7 +49,7 @@ static struct dma_ring *dma_wr; /* WDATA DMA buffer */
 /* Statically-allocated floppy drive state. Tracks head movements and 
  * side changes at all times, even when the drive is empty. */
 static struct drive {
-    uint8_t cyl, head, nr_sides;
+    uint8_t cyl, head;
     bool_t writing;
     bool_t sel;
     bool_t index_suppressed; /* disable IDX while writing to USB stick */
@@ -213,7 +213,7 @@ static void floppy_mount(struct slot *slot)
 
         /* Mount the image file. */
         image_open(im, slot, cltbl);
-        if (!im->handler->write_track || volume_readonly())
+        if (!im->disk_handler->write_track || volume_readonly())
             slot->attributes |= AM_RDO;
         if (slot->attributes & AM_RDO) {
             printk("Image is R/O\n");
@@ -232,6 +232,7 @@ static void floppy_mount(struct slot *slot)
 
     /* Make allocated state globally visible now. */
     drv->image = image = im;
+    barrier(); /* image ptr /then/ dma rings */
     dma_rd = _dma_rd;
     dma_wr = _dma_wr;
 
@@ -308,8 +309,7 @@ static void timer_dma_init(void)
 
 static unsigned int drive_calc_track(struct drive *drv)
 {
-    drv->nr_sides = (drv->cyl >= DA_FIRST_CYL) ? 1 : drv->image->nr_sides;
-    return drv->cyl*2 + (drv->head & (drv->nr_sides - 1));
+    return drv->cyl*2 + (drv->head & (drv->image->nr_sides - 1));
 }
 
 /* Find current rotational position for read-stream restart. */
