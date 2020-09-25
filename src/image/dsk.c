@@ -441,10 +441,34 @@ static bool_t dsk_read_track(struct image *im)
     return TRUE;
 }
 
+static int dsk_find_first_write_sector(
+    struct image *im, struct write *write, struct tib *tib)
+{
+    unsigned int i;
+    int32_t base = write->start / im->ticks_per_cell; /* in data bytes */
+
+    /* Convert write offset to sector number (in rotational order). */
+    base -= im->dsk.idx_sz + im->dsk.idam_sz;
+    for (i = 0; i < tib->nr_secs; i++) {
+        /* Within small range of expected data start? */
+        if ((base >= -64) && (base <= 64))
+            break;
+        base -= im->dsk.idam_sz + im->dsk.dam_sz_pre
+            + data_sz(&tib->sib[i]) + im->dsk.dam_sz_post;
+        if (is_gaps_sector(&tib->sib[i]))
+            base += im->dsk.dam_sz_post;
+    }
+
+    if (i >= tib->nr_secs) {
+        printk("DSK Bad Wr.Off: %d\n", base);
+        return -2;
+    }
+
+    return i;
+}
+
 static bool_t dsk_write_track(struct image *im)
 {
-    const uint8_t header[] = { 0xa1, 0xa1, 0xa1, 0xfb };
-
     bool_t flush;
     struct write *write = get_write(im, im->wr_cons);
     struct tib *tib = tib_p(im);
@@ -453,10 +477,9 @@ static bool_t dsk_write_track(struct image *im)
     unsigned int bufmask = (wr->len / 2) - 1;
     uint8_t *wrbuf = (uint8_t *)im->bufs.write_data.p + 512; /* skip DIB/TIB */
     uint32_t c = wr->cons / 16, p = wr->prod / 16;
-    int32_t base = write->start / im->ticks_per_cell; /* in data bytes */
     unsigned int i;
     time_t t;
-    uint16_t crc, sec_sz, off;
+    uint16_t crc, off;
     uint8_t x;
 
     /* If we are processing final data then use the end index, rounded up. */
@@ -465,40 +488,15 @@ static bool_t dsk_write_track(struct image *im)
     if (flush)
         p = (write->bc_end + 15) / 16;
 
-    if (im->dsk.write_sector == -1) {
-        /* Convert write offset to sector number (in rotational order). */
-        base -= im->dsk.idx_sz + im->dsk.idam_sz;
-        for (i = 0; i < tib->nr_secs; i++) {
-            /* Within small range of expected data start? */
-            if ((base >= -64) && (base <= 64))
-                break;
-            base -= im->dsk.idam_sz + im->dsk.dam_sz_pre
-                + data_sz(&tib->sib[i]) + im->dsk.dam_sz_post;
-            if (is_gaps_sector(&tib->sib[i]))
-                base += im->dsk.dam_sz_post;
-        }
-        im->dsk.write_sector = i;
-        if (im->dsk.write_sector >= tib->nr_secs) {
-            printk("DSK Bad Sector Offset: %u -> %u\n",
-                   base, im->dsk.write_sector);
-            im->dsk.write_sector = -2;
-        }
-    }
+    while ((int16_t)(p - c) > 128) {
 
-    for (;;) {
+        uint32_t sc = c;
 
-        sec_sz = (im->dsk.write_sector >= 0)
-            ? data_sz(&tib->sib[im->dsk.write_sector]) : 128;
-        if ((int16_t)(p - c) < (3 + sec_sz + 2))
-            break;
-
-        /* Scan for sync words and IDAM. Because of the way we sync we expect
-         * to see only 2*4489 and thus consume only 3 words for the header. */
         if (be16toh(buf[c++ & bufmask]) != 0x4489)
             continue;
-        for (i = 0; i < 2; i++)
-            if ((x = mfmtobin(buf[c++ & bufmask])) != 0xa1)
-                break;
+        if ((x = mfmtobin(buf[c & bufmask])) == 0xa1)
+            continue;
+        c++;
 
         switch (x) {
 
@@ -510,7 +508,7 @@ static bool_t dsk_write_track(struct image *im)
                 wrbuf[i] = mfmtobin(buf[c++ & bufmask]);
             crc = crc16_ccitt(wrbuf, i, 0xffff);
             if (crc != 0) {
-                printk("DSK IDAM Bad CRC %04x, sector %02x\n", crc, wrbuf[6]);
+                printk("DSK IDAM Bad CRC: %04x, %02x\n", crc, wrbuf[6]);
                 break;
             }
             /* Convert logical sector number -> rotational number. */
@@ -525,24 +523,31 @@ static bool_t dsk_write_track(struct image *im)
             break;
 
         case 0xfb: /* DAM */ {
-            unsigned int nr, todo;
+            unsigned int nr, todo, sec_sz;
+            int sec_nr = im->dsk.write_sector;
 
-            if (im->dsk.write_sector < 0) {
-                printk("DSK DAM for unknown sector (%d)\n",
-                       im->dsk.write_sector);
-                c += sec_sz + 2;
-                break;
+            if (sec_nr < 0) {
+                if (sec_nr == -1)
+                    sec_nr = dsk_find_first_write_sector(im, write, tib);
+                if (sec_nr < 0) {
+                    printk("DSK DAM Unknown\n");
+                    goto dam_out;
+                }
             }
 
-            crc = crc16_ccitt(header, 4, 0xffff);
+            sec_sz = data_sz(&tib->sib[sec_nr]);
+            if ((int16_t)(p - c) < (sec_sz + 2)) {
+                c = sc;
+                goto out;
+            }
 
-            printk("Write %d[%02x]/%u... ", im->dsk.write_sector,
-                   (im->dsk.write_sector >= 0)
-                   ? tib->sib[im->dsk.write_sector].r : 0xff,
-                   tib->nr_secs);
+            crc = MFM_DAM_CRC;
+
+            printk("Write %d[%02x]/%u... ",
+                   sec_nr, tib->sib[sec_nr].r, tib->nr_secs);
             t = time_now();
 
-            for (i = off = 0; i < im->dsk.write_sector; i++)
+            for (i = off = 0; i < sec_nr; i++)
                 off += tib->sib[i].actual_length;
             F_lseek(&im->fp, im->dsk.trk_off + off);
 
@@ -560,20 +565,20 @@ static bool_t dsk_write_track(struct image *im)
             c += 2;
             crc = crc16_ccitt(wrbuf, 2, crc);
             if (crc != 0) {
-                printk("DSK Bad CRC %04x, sector %d[%02x]\n",
-                       crc, im->dsk.write_sector,
-                       (im->dsk.write_sector >= 0)
-                       ? tib->sib[im->dsk.write_sector].r : 0xff);
+                printk("DSK Bad CRC: %04x, %d[%02x]\n",
+                       crc, sec_nr, tib->sib[sec_nr].r);
             }
 
+            dam_out:
+            im->dsk.write_sector = -2;
             break;
         }
 
         }
     }
 
+out:
     wr->cons = c * 16;
-
     return flush;
 }
 

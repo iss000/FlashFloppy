@@ -1761,10 +1761,37 @@ static bool_t raw_read_track(struct image *im)
     return (im->sync == SYNC_fm) ? fm_read_track(im) : mfm_read_track(im);
 }
 
+static int raw_find_first_write_sector(
+    struct image *im, struct write *write, struct raw_trk *trk)
+{
+    uint8_t *sec_map = im->img.sec_map;
+    unsigned int i;
+    int32_t base;
+
+    base = write->start / im->ticks_per_cell; /* in data bytes */
+    base -= im->img.track_delay_bc;
+    if (base < 0)
+        base += im->tracklen_bc;
+
+    /* Convert write offset to sector number (in rotational order). */
+    base -= im->img.idx_sz + im->img.idam_sz;
+    for (i = 0; i < trk->nr_sectors; i++) {
+        /* Within small range of expected data start? */
+        if ((base >= -64) && (base <= 64))
+            break;
+        base -= enc_sec_sz(im, &im->img.sec_info[*sec_map++]);
+    }
+
+    /* Convert rotational order to logical order. */
+    if (i >= trk->nr_sectors) {
+        printk("IMG Bad Wr.Off: %d\n", base);
+        return -2;
+    }
+    return *sec_map;
+}
+
 static bool_t raw_write_track(struct image *im)
 {
-    const uint8_t mfm_dam_header[] = { 0xa1, 0xa1, 0xa1, 0xfb };
-
     bool_t flush;
     struct raw_trk *trk = im->img.trk;
     struct write *write = get_write(im, im->wr_cons);
@@ -1776,9 +1803,8 @@ static bool_t raw_write_track(struct image *im)
     struct raw_sec *sec;
     unsigned int i, off;
     time_t t;
-    uint16_t crc, sec_sz;
-    uint8_t id, x, *sec_map;
-    int32_t base;
+    uint16_t crc;
+    uint8_t id, x;
 
     /* If we are processing final data then use the end index, rounded up. */
     barrier();
@@ -1786,42 +1812,13 @@ static bool_t raw_write_track(struct image *im)
     if (flush)
         p = (write->bc_end + 15) / 16;
 
-    if (im->img.write_sector == -1) {
-        base = write->start / im->ticks_per_cell; /* in data bytes */
-        sec_map = im->img.sec_map;
+    while ((int16_t)(p - c) > 128) {
 
-        base -= im->img.track_delay_bc;
-        if (base < 0)
-            base += im->tracklen_bc;
-
-        /* Convert write offset to sector number (in rotational order). */
-        base -= im->img.idx_sz + im->img.idam_sz;
-        for (i = 0; i < trk->nr_sectors; i++) {
-            /* Within small range of expected data start? */
-            if ((base >= -64) && (base <= 64))
-                break;
-            base -= enc_sec_sz(im, &im->img.sec_info[*sec_map++]);
-        }
-
-        /* Convert rotational order to logical order. */
-        if (i >= trk->nr_sectors) {
-            printk("IMG Bad Sector Offset: %u -> %u\n", base, i);
-            im->img.write_sector = -2;
-        } else {
-            im->img.write_sector = *sec_map;
-        }
-    }
-
-    for (;;) {
-
-        sec_sz = (im->img.write_sector >= 0)
-            ? sec_sz(im->img.sec_info[im->img.write_sector].no) : 128;
+        uint32_t sc = c;
 
         if (im->sync == SYNC_fm) {
 
             uint16_t sync;
-            if ((int16_t)(p - c) < (2 + sec_sz + 2))
-                break;
             if (buf[c++ & bufmask] != 0xaaaa)
                 continue;
             sync = buf[c & bufmask];
@@ -1832,16 +1829,11 @@ static bool_t raw_write_track(struct image *im)
 
         } else { /* MFM */
 
-            if ((int16_t)(p - c) < (3 + sec_sz + 2))
-                break;
-            /* Scan for sync words and IDAM. Because of the way we sync we
-             * expect to see only 2*4489 and thus consume only 3 words for the
-             * header. */
             if (be16toh(buf[c++ & bufmask]) != 0x4489)
                 continue;
-            for (i = 0; i < 2; i++)
-                if ((x = mfmtobin(buf[c++ & bufmask])) != 0xa1)
-                    break;
+            if ((x = mfmtobin(buf[c & bufmask])) == 0xa1)
+                continue;
+            c++;
 
         }
 
@@ -1863,7 +1855,7 @@ static bool_t raw_write_track(struct image *im)
             }
             crc = crc16_ccitt(wrbuf, i, 0xffff);
             if (crc != 0) {
-                printk("IMG IDAM Bad CRC %04x, sector %u\n", crc, id);
+                printk("IMG IDAM Bad CRC: %04x, %u\n", crc, id);
                 break;
             }
             /* Search by sector id for this sector's logical order. */
@@ -1879,29 +1871,35 @@ static bool_t raw_write_track(struct image *im)
             break;
 
         case 0xfb: /* DAM */ {
-            unsigned int nr, todo;
+            unsigned int nr, todo, sec_sz;
+            int sec_nr = im->img.write_sector;
 
-            if (im->img.write_sector < 0) {
-                printk("IMG DAM for unknown sector (%d)\n",
-                       im->img.write_sector);
-                c += sec_sz + 2;
-                break;
+            if (sec_nr < 0) {
+                if (sec_nr == -1)
+                    sec_nr = raw_find_first_write_sector(im, write, trk);
+                if (sec_nr < 0) {
+                    printk("IMG DAM Unknown\n");
+                    goto dam_out;
+                }
             }
 
-            crc = (im->sync == SYNC_fm)
-                ? crc16_ccitt(&x, 1, 0xffff)
-                : crc16_ccitt(mfm_dam_header, 4, 0xffff);
+            sec_sz = sec_sz(im->img.sec_info[sec_nr].no);
+            if ((int16_t)(p - c) < (sec_sz + 2)) {
+                c = sc;
+                goto out;
+            }
 
-            sec = &im->img.sec_info[im->img.write_sector];
-            printk("Write %u[%02x]/%u... ", im->img.write_sector,
-                   sec->id, trk->nr_sectors);
+            crc = (im->sync == SYNC_fm) ? FM_DAM_CRC : MFM_DAM_CRC;
+
+            sec = &im->img.sec_info[sec_nr];
+            printk("Write %u[%02x]/%u... ", sec_nr, sec->id, trk->nr_sectors);
             t = time_now();
 
-            sec = im->img.sec_info;
             if (im->img.file_sec_offsets) {
-                off = im->img.file_sec_offsets[im->img.write_sector];
+                off = im->img.file_sec_offsets[sec_nr];
             } else {
-                for (i = off = 0; i < im->img.write_sector; i++)
+                sec = im->img.sec_info;
+                for (i = off = 0; i < sec_nr; i++)
                     off += sec_sz(sec++->no);
             }
             F_lseek(&im->fp, im->img.trk_off + off);
@@ -1921,18 +1919,20 @@ static bool_t raw_write_track(struct image *im)
             c += 2;
             crc = crc16_ccitt(wrbuf, 2, crc);
             if (crc != 0) {
-                printk("IMG Bad CRC %04x, sector %u[%02x]\n",
-                       crc, im->img.write_sector, sec->id);
+                printk("IMG Bad CRC: %04x, %u[%02x]\n",
+                       crc, sec_nr, sec->id);
             }
 
+            dam_out:
+            im->img.write_sector = -2;
             break;
         }
 
         }
     }
 
+out:
     wr->cons = c * 16;
-
     return flush;
 }
 
@@ -2296,15 +2296,14 @@ static bool_t mfm_read_track(struct image *im)
             break;
         }
         case 1: /* DAM */ {
-            uint8_t dam[4] = { 0xa1, 0xa1, 0xa1, 0xfb };
             if (bc_space < im->img.dam_sz_pre)
                 return FALSE;
             for (i = 0; i < GAP_SYNC; i++)
                 emit_byte(0x00);
             for (i = 0; i < 3; i++)
                 emit_raw(0x4489);
-            emit_byte(dam[3]);
-            im->img.crc = crc16_ccitt(dam, sizeof(dam), 0xffff);
+            emit_byte(0xfb);
+            im->img.crc = MFM_DAM_CRC;
             break;
         }
         case 2: /* Data */ {
@@ -2486,13 +2485,12 @@ static bool_t fm_read_track(struct image *im)
             break;
         }
         case 1: /* DAM */ {
-            uint8_t dam[1] = { 0xfb };
             if (bc_space < im->img.dam_sz_pre)
                 return FALSE;
             for (i = 0; i < FM_GAP_SYNC; i++)
                 emit_byte(0x00);
-            emit_raw(fm_sync(dam[0], FM_SYNC_CLK));
-            im->img.crc = crc16_ccitt(dam, sizeof(dam), 0xffff);
+            emit_raw(fm_sync(0xfb, FM_SYNC_CLK));
+            im->img.crc = FM_DAM_CRC;
             break;
         }
         case 2: /* Data */ {

@@ -75,6 +75,15 @@ static void native_get_slot_map(bool_t sorted_only);
 /* Hack inside the guts of FatFS. */
 void flashfloppy_fill_fileinfo(FIL *fp);
 
+#ifdef LOGFILE
+/* Logfile must be written to config dir. */
+#define logfile_flush(_file) do {               \
+    fatfs.cdir = cfg.cfg_cdir;                  \
+    logfile_flush(_file);                       \
+    fatfs.cdir = cfg.cur_cdir;                  \
+} while(0)
+#endif
+
 static bool_t slot_valid(unsigned int i)
 {
     if (i > cfg.max_slot_nr)
@@ -150,7 +159,7 @@ static void lcd_scroll_init(uint16_t pause, uint16_t rate)
 static void lcd_scroll_name(void)
 {
     static struct track_info ti;
-    char msg[25];
+    char msg[lcd_columns+1];
 
     if ((lcd_scroll.ticks > 0) || (lcd_scroll.end == 0))
         return;
@@ -191,7 +200,7 @@ static void lcd_scroll_name(void)
 static void display_write_slot(bool_t nav_mode)
 {
     const struct image_type *type;
-    char msg[25], typename[4] = "";
+    char msg[lcd_columns+1], typename[4] = "";
     unsigned int i;
 
     if (display_mode != DM_LCD_OLED) {
@@ -435,7 +444,8 @@ static uint8_t read_rotary(uint8_t rotary)
     /* Record this transition and check if we have seen enough to get 
      * us from one detent to another. */
     ts |= (1<<rotary);
-    if (popcount(ts) < rotary_transitions_per_detent[ff_cfg.rotary & 3]) {
+    if ((popcount(ts) < rotary_transitions_per_detent[ff_cfg.rotary & 3])
+        || (((ff_cfg.rotary & 3) == ROT_full) && ((rotary & 3) != 3))) {
         /* Not enough transitions yet: Remember where we are for next time. */
         t_seen[rb-1] = ts;
         return 0;
@@ -445,27 +455,51 @@ static uint8_t read_rotary(uint8_t rotary)
      * and return the movement to the caller. */
     t_seen[0] = t_seen[1] = 0;
     return rb;
-#undef pt
+#undef p_t
 }
 
 static struct timer button_timer;
-static volatile uint8_t buttons;
-static uint8_t rotary;
+static volatile uint8_t buttons, velocity;
+static uint8_t rotary, rb;
 #define B_LEFT 1
 #define B_RIGHT 2
 #define B_SELECT 4
+
+void IRQ_rotary(void)
+{
+    if ((ff_cfg.rotary & ~ROT_reverse) != ROT_full)
+        return;
+    rotary = ((rotary << 2) | ((gpioc->idr >> 10) & 3)) & 15;
+    rb = read_rotary(rotary) ?: rb;
+}
+
+static void set_rotary_exti(void)
+{
+    uint32_t imr;
+
+    imr = exti->imr & ~0x0c00;
+    if ((ff_cfg.rotary & ~ROT_reverse) == ROT_full)
+        imr |= 0x0c00;
+    exti->imr = imr;
+}
+
 static void button_timer_fn(void *unused)
 {
     const uint8_t rotary_reverse[4] = {
         [B_LEFT] = B_RIGHT, [B_RIGHT] = B_LEFT
     };
 
-    static uint8_t rotary_ticks, rotary_scan_rate, rb;
+    static uint16_t cur_time, prev_time;
     static uint32_t _b[3]; /* 0 = left, 1 = right, 2 = select */
     uint8_t b = osd_buttons_rx;
     bool_t twobutton_rotary =
         (ff_cfg.twobutton_action & TWOBUTTON_mask) == TWOBUTTON_rotary;
     int i, twobutton_reverse = !!(ff_cfg.twobutton_action & TWOBUTTON_reverse);
+
+    cur_time++;
+    if ((uint16_t)(cur_time - prev_time) > 0x7fff)
+        prev_time = cur_time - 0x7fff;
+    velocity = 0;
 
     /* Check PA5 (USBFLT, active low). */
     if (gotek_enhanced() && !gpio_read_pin(gpioa, 5)) {
@@ -473,24 +507,6 @@ static void button_timer_fn(void *unused)
         cfg.usb_power_fault = TRUE;
         gpio_write_pin(gpioa, 4, HIGH);
     }
-
-    /* Higher sample rate can be specified for rotary encoder. */
-    if (++rotary_ticks < rotary_scan_rate) {
-        switch (ff_cfg.rotary & ~ROT_reverse) {
-        case ROT_trackball:
-        case ROT_buttons:
-        case ROT_none:
-            break;
-        default: /* rotary encoder */ {
-            rotary = ((rotary << 2) | ((gpioc->idr >> 10) & 3)) & 15;
-            rb = read_rotary(rotary) ?: rb;
-            break;
-        }
-        }
-        goto out;
-    }
-    rotary_ticks = 0;
-    rotary_scan_rate = 1;
 
     /* We debounce the switches by waiting for them to be pressed continuously 
      * for 32 consecutive sample periods (32 * 2ms == 64ms) */
@@ -547,7 +563,12 @@ static void button_timer_fn(void *unused)
 
     default: /* rotary encoder */ {
         rb = read_rotary(rotary) ?: rb;
-        rotary_scan_rate = 4; /* sample rotary inputs at 4x button rate */
+        if (rb) {
+            uint16_t delta = cur_time - prev_time;
+            velocity = (BUTTON_SCAN_HZ/10)/(delta?:1);
+            velocity = range_t(int, velocity, 0, 20);
+            prev_time = cur_time;
+        }
         break;
     }
 
@@ -568,9 +589,7 @@ static void button_timer_fn(void *unused)
 
     /* Latch final button state and reset the timer. */
     buttons = b;
-out:
-    timer_set(&button_timer, button_timer.deadline
-              + time_ms(BUTTON_SCAN_MS) / rotary_scan_rate);
+    timer_set(&button_timer, button_timer.deadline + time_ms(BUTTON_SCAN_MS));
 }
 
 static void canary_init(void)
@@ -582,6 +601,16 @@ static void canary_check(void)
 {
     ASSERT(_irq_stackbottom[0] == 0xdeadbeef);
     ASSERT(_thread_stackbottom[0] == 0xdeadbeef);
+}
+
+static void fix_hxc_short_slot(struct short_slot *short_slot)
+{
+    char *dot;
+    /* Get rid of trailing file extension. */
+    short_slot->name[51] = '\0';
+    if (((dot = strrchr(short_slot->name, '.')) != NULL)
+        && !strcmp(dot+1, short_slot->type))
+        *dot = '\0';
 }
 
 static void slot_from_short_slot(
@@ -839,6 +868,7 @@ static void update_slot_by_name(void)
                 F_read(&fs->file, &hxc->v2_slot, sizeof(hxc->v2_slot), NULL);
                 break;
             }
+            fix_hxc_short_slot(&hxc->v2_slot);
             if (!strncmp(hxc->v2_slot.name, name,
                          min_t(int, len, sizeof(hxc->v2_slot.name))))
                 break;
@@ -1226,6 +1256,9 @@ static void read_ff_cfg(void)
 
 static void process_ff_cfg_opts(const struct ff_cfg *old)
 {
+    if (ff_cfg.rotary != old->rotary)
+        set_rotary_exti();
+
     /* interface, pin02, pin34: Inform the floppy subsystem. */
     if ((ff_cfg.interface != old->interface)
         || (ff_cfg.pin02 != old->pin02)
@@ -1704,6 +1737,7 @@ static void hxc_cfg_update(uint8_t slot_mode)
             memcpy(&hxc->v2_slot.attributes, &hxc->v1_slot.attributes,
                    1+4+4+17);
             hxc->v2_slot.name[17] = '\0';
+            fix_hxc_short_slot(&hxc->v2_slot);
             slot_from_short_slot(&cfg.slot, &hxc->v2_slot);
         }
         break;
@@ -1737,6 +1771,7 @@ static void hxc_cfg_update(uint8_t slot_mode)
             F_lseek(&fs->file, hxc->cfg.slots_position*512
                     + cfg.slot_nr*64*hxc->cfg.number_of_drive_per_slot);
             F_read(&fs->file, &hxc->v2_slot, sizeof(hxc->v2_slot), NULL);
+            fix_hxc_short_slot(&hxc->v2_slot);
             slot_from_short_slot(&cfg.slot, &hxc->v2_slot);
         }
         break;
@@ -1893,8 +1928,15 @@ static bool_t choose_new_image(uint8_t init_b)
                    && buttons)
                 continue;
         } else if (b & B_LEFT) {
+            i -= velocity ?: 1;
+            if ((i < 0) && !ff_cfg.nav_loop) {
+                i = 0;
+                goto b_right;
+            }
+            while (i < 0)
+                i += cfg.max_slot_nr + 1;
         b_left:
-            do {
+            while (!slot_valid(i)) {
                 if (i-- == 0) {
                     if (!ff_cfg.nav_loop)
                         goto b_right;
@@ -1902,14 +1944,20 @@ static bool_t choose_new_image(uint8_t init_b)
                 }
             } while (!slot_valid(i));
         } else { /* b & B_RIGHT */
+            i += velocity ?: 1;
+            if ((i > cfg.max_slot_nr) && !ff_cfg.nav_loop) {
+                i = cfg.max_slot_nr;
+                goto b_left;
+            }
+            i = i % (cfg.max_slot_nr + 1);
         b_right:
-            do {
+            while (!slot_valid(i)) {
                 if (i++ >= cfg.max_slot_nr) {
                     if (!ff_cfg.nav_loop)
                         goto b_left;
                     i = 0;
                 }
-            } while (!slot_valid(i));
+            }
         }
 
         cfg.slot_nr = i;
@@ -2876,6 +2924,7 @@ int main(void)
     usbh_msc_init();
 
     rotary = (gpioc->idr >> 10) & 3;
+    set_rotary_exti();
     timer_init(&button_timer, button_timer_fn, NULL);
     timer_set(&button_timer, time_now());
 

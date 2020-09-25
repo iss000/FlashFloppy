@@ -86,7 +86,8 @@ static void oled_init(void);
 static unsigned int oled_prep_buffer(void);
 
 static void i2c_stop(void);
-static bool_t i2c_btf_stop(void);
+
+static void dma_tx_tc_btf(void);
 
 /* Count of display-refresh completions. For synchronisation/flush. */
 static volatile uint8_t refresh_count;
@@ -150,6 +151,13 @@ static void IRQ_i2c_event(void)
         (void)i2c->sr2;
         /* No more events: data phase is driven by DMA. */
         i2c->cr2 &= ~I2C_CR2_ITEVTEN;
+    }
+
+    if (sr1 & I2C_SR1_BTF) {
+        /* DMA transfer fully complete: I2C is now idle. Disable further events
+         * and return control to the DMA pipeline. */
+        i2c->cr2 &= ~I2C_CR2_ITEVTEN;
+        dma_tx_tc_btf();
     }
 }
 
@@ -243,15 +251,16 @@ static unsigned int lcd_prep_buffer(void)
 
     if (i2c_row == lcd_rows) {
         i2c_row++;
-        if (has_osd)
-            return i2c_btf_stop() ? osd_prep_buffer() : 0;
+        if (has_osd) {
+            i2c_stop();
+            return osd_prep_buffer();
+        }
     }
 
     if (i2c_row > lcd_rows) {
         i2c_row = 0;
         refresh_count++;
-        if (!i2c_btf_stop())
-            return 0;
+        i2c_stop();
         i2c->cr2 |= I2C_CR2_ITEVTEN;
         i2c->cr1 |= I2C_CR1_START;
     }
@@ -273,16 +282,30 @@ static unsigned int lcd_prep_buffer(void)
 
 static void IRQ_dma_tx_tc(void)
 {
-    unsigned int dma_sz;
-
     /* Clear the DMA controller. */
     dma1->ch4.ccr = 0;
     dma1->ifcr = DMA_IFCR_CGIF(4);
 
+    /* Wait for BTF. We then get called back on dma_tx_tc_btf().
+     *
+     * Q: Why do we always wait for BTF, even if we're issuing another DMA?
+     * A: Otherwise the start of next DMA races BTF. If we lose that race, BTF
+     * is set for the rest of the transfer (since we don't read SR1) and a
+     * wait for BTF at the end of the final DMA transfer would erroneously
+     * succeed immediately. We would then STOP too early and lose the last
+     * byte of the transfer. */
+    i2c->cr2 |= I2C_CR2_ITEVTEN;
+}
+
+static void dma_tx_tc_btf(void)
+{
+    unsigned int dma_sz;
+
     /* Prepare the DMA buffer and start the next DMA sequence. */
     in_osd = OSD_no;
     if (i2c_addr == 0) {
-        dma_sz = i2c_btf_stop() ? osd_prep_buffer() : 0;
+        i2c_stop();
+        dma_sz = osd_prep_buffer();
     } else {
         dma_sz = is_oled_display ? oled_prep_buffer() : lcd_prep_buffer();
     }
@@ -346,21 +369,6 @@ static void i2c_stop(void)
     i2c->cr1 |= I2C_CR1_STOP;
     while (i2c->cr1 & I2C_CR1_STOP)
         continue;
-}
-
-static bool_t i2c_btf_stop(void)
-{
-    /* Wait for BTF. */
-    while (!(i2c->sr1 & I2C_SR1_BTF)) {
-        /* Any errors: bail and leave it to the Error ISR. */
-        if (i2c->sr1 & I2C_SR1_ERRORS)
-            return FALSE;
-    }
-
-    /* Send STOP. Clears SR1_TXE and SR1_BTF. */
-    i2c_stop();
-
-    return TRUE;
 }
 
 /* Synchronously transmit an I2C byte. */
@@ -771,7 +779,7 @@ static unsigned int oled_start_i2c(uint8_t *buf)
     static const uint8_t ssd1306_addr_cmds[] = {
         0x20, 0,      /* horizontal addressing mode */
         0x21, 0, 127, /* column address range: 0-127 */
-        0x22, 0, /*?*//* page address range: 0-? */
+        0x22, 0, 7,   /* page address range: 0-7 */
     }, ztech_addr_cmds[] = {
         0xda, 0x12,   /* alternate com pins config */
         0x21, 4, 131, /* column address range: 4-131 */
@@ -791,8 +799,6 @@ static unsigned int oled_start_i2c(uint8_t *buf)
         *dc++ = 0xb0 + i2c_row;
     } else {
         p += oled_queue_cmds(p, ssd1306_addr_cmds, sizeof(ssd1306_addr_cmds));
-        /* Page address max: depends on display height */
-        *dc++ = (oled_height / 8) - 1;
     }
 
     /* Display on/off according to backlight setting. */
@@ -852,15 +858,16 @@ static unsigned int ssd1306_prep_buffer(void)
      * a byte and then we lose sync with the display address. */
     if (i2c_row == (oled_height / 16)) {
         i2c_row++;
-        if (has_osd)
-            return i2c_btf_stop() ? osd_prep_buffer() : 0;
+        if (has_osd) {
+            i2c_stop();
+            return osd_prep_buffer();
+        }
     }
 
     if (i2c_row > (oled_height / 16)) {
         i2c_row = 0;
         refresh_count++;
-        if (!i2c_btf_stop())
-            return 0;
+        i2c_stop();
         return oled_start_i2c(buffer);
     }
 
@@ -881,8 +888,10 @@ static unsigned int sh1106_prep_buffer(void)
 
     if (i2c_row == (oled_height / 8)) {
         i2c_row++;
-        if (has_osd)
-            return i2c_btf_stop() ? osd_prep_buffer() : 0;
+        if (has_osd) {
+            i2c_stop();
+            return osd_prep_buffer();
+        }
     }
 
     if (i2c_row > (oled_height / 8)) {
@@ -901,8 +910,7 @@ static unsigned int sh1106_prep_buffer(void)
     }
 
     /* Every 8 rows needs a new page address and hence new I2C transaction. */
-    if (!i2c_btf_stop())
-        return 0;
+    i2c_stop();
     p += oled_start_i2c(p);
 
     /* Patch the data bytes onto the end of the address setup sequence. */

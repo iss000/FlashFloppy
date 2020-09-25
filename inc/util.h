@@ -43,6 +43,7 @@ typedef char bool_t;
     ({ type __x = (x); type __y = (y); __x < __y ? __x: __y; })
 #define max_t(type,x,y) \
     ({ type __x = (x); type __y = (y); __x > __y ? __x: __y; })
+#define range_t(type,x,a,b) min_t(type, max_t(type, x, a), b)
 
 struct slot {
     char name[FF_MAX_LFN+1];
@@ -185,6 +186,7 @@ uint16_t get_slot_nr(void);
 bool_t set_slot_nr(uint16_t slot_nr);
 void set_slot_name(const char *name);
 bool_t get_img_cfg(struct slot *slot);
+void IRQ_rotary(void);
 
 extern bool_t menu_mode;
 extern uint8_t board_id;

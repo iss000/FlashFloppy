@@ -247,8 +247,7 @@ static bool_t fm_read_track(struct image *im)
         emit_raw(fm_sync(dam[0], FM_SYNC_CLK));
         for (i = 0; i < SEC_SZ; i++)
             emit_byte(buf[i]);
-        crc = crc16_ccitt(dam, sizeof(dam), 0xffff);
-        crc = crc16_ccitt(buf, SEC_SZ, crc);
+        crc = crc16_ccitt(buf, SEC_SZ, FM_DAM_CRC);
         emit_byte(crc >> 8);
         emit_byte(crc);
         for (i = 0; i < FM_GAP_3; i++)
@@ -331,8 +330,7 @@ static bool_t mfm_read_track(struct image *im)
         emit_byte(dam[3]);
         for (i = 0; i < SEC_SZ; i++)
             emit_byte(buf[i]);
-        crc = crc16_ccitt(dam, sizeof(dam), 0xffff);
-        crc = crc16_ccitt(buf, SEC_SZ, crc);
+        crc = crc16_ccitt(buf, SEC_SZ, MFM_DAM_CRC);
         emit_byte(crc >> 8);
         emit_byte(crc);
         for (i = 0; i < MFM_GAP_3; i++)
@@ -392,7 +390,7 @@ static bool_t fm_write_track(struct image *im)
         mfm_ring_to_bin(buf, bufmask, c, wrbuf, SEC_SZ + 2);
         c += SEC_SZ + 2;
 
-        process_wdata(im, sect, crc16_ccitt(&x, 1, 0xffff));
+        process_wdata(im, sect, FM_DAM_CRC);
     }
 
     wr->cons = c * 16;
@@ -410,7 +408,7 @@ static bool_t mfm_write_track(struct image *im)
     uint8_t *wrbuf = im->bufs.write_data.p;
     uint32_t c = wr->cons / 16, p = wr->prod / 16;
     uint32_t base = write->start / im->ticks_per_cell; /* in data bytes */
-    unsigned int sect, i;
+    unsigned int sect;
     uint16_t crc;
     uint8_t x;
 
@@ -420,17 +418,15 @@ static bool_t mfm_write_track(struct image *im)
     if (flush)
         p = (write->bc_end + 15) / 16;
 
-    while ((int16_t)(p - c) >= (3 + SEC_SZ + 2)) {
+    while ((int16_t)(p - c) > 128) {
 
-        uint32_t _c = c;
+        uint32_t sc = c;
 
-        /* Scan for sync words and IDAM. Because of the way we sync we expect
-         * to see only 2*4489 and thus consume only 3 words for the header. */
         if (be16toh(buf[c++ & bufmask]) != 0x4489)
             continue;
-        for (i = 0; i < 2; i++)
-            if ((x = mfmtobin(buf[c++ & bufmask])) != 0xa1)
-                break;
+        if ((x = mfmtobin(buf[c & bufmask])) == 0xa1)
+            continue;
+        c++;
 
         switch (x) {
 
@@ -442,10 +438,9 @@ static bool_t mfm_write_track(struct image *im)
         }
 
         case 0xfb: /* Ordinary Sector */ {
-            const uint8_t header[] = { 0xa1, 0xa1, 0xa1, 0xfb };
             sect = (base - im->da.idx_sz - im->da.idam_sz + enc_sec_sz(im)/2)
                 / enc_sec_sz(im);
-            crc = crc16_ccitt(header, 4, 0xffff);
+            crc = MFM_DAM_CRC;
             break;
         }
 
@@ -455,8 +450,8 @@ static bool_t mfm_write_track(struct image *im)
         }
 
         if ((int16_t)(p - c) < (SEC_SZ + 2)) {
-            c = _c;
-            break;
+            c = sc;
+            goto out;
         }
 
         mfm_ring_to_bin(buf, bufmask, c, wrbuf, SEC_SZ + 2);
@@ -465,8 +460,8 @@ static bool_t mfm_write_track(struct image *im)
         process_wdata(im, sect, crc);
     }
 
+out:
     wr->cons = c * 16;
-
     return flush;
 }
 
