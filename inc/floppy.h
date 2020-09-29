@@ -18,8 +18,9 @@
 #define FINTF_SHUGART     0
 #define FINTF_IBMPC       1
 #define FINTF_IBMPC_HDOUT 2
-#define FINTF_AKAI_S950   3
+#define FINTF_JPPC_HDOUT  3
 #define FINTF_AMIGA       4
+#define FINTF_JPPC        5
 
 #define outp_dskchg 0
 #define outp_index  1
@@ -34,10 +35,12 @@
 
 struct adf_image {
     uint32_t trk_off;
-    uint16_t trk_pos, trk_len;
+    uint32_t sec_idx;
     int32_t decode_pos;
     uint32_t pre_idx_gap_bc;
     uint32_t nr_secs;
+    uint32_t written_secs;
+    uint8_t sec_map[2][22];
 };
 
 struct hfe_image {
