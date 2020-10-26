@@ -61,7 +61,8 @@ struct packed ff_cfg {
 #define TWOBUTTON_eject       1
 #define TWOBUTTON_rotary      2
 #define TWOBUTTON_rotary_fast 3
-#define TWOBUTTON_mask        3
+#define TWOBUTTON_htu         4
+#define TWOBUTTON_mask        7
 #define TWOBUTTON_reverse     (1u<<7)
     uint8_t twobutton_action;
 #define NAVMODE_default 0
@@ -112,6 +113,8 @@ struct packed ff_cfg {
 #define ROT_quarter   2
 #define ROT_trackball 4
 #define ROT_buttons   5
+#define ROT_typemask 15
+#define ROT_v2      (1u<<6)
 #define ROT_reverse (1u<<7)
     uint8_t rotary;
     bool_t write_protect;
