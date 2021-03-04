@@ -3,18 +3,18 @@ CC = $(TOOL_PREFIX)gcc
 OBJCOPY = $(TOOL_PREFIX)objcopy
 LD = $(TOOL_PREFIX)ld
 
-PYTHON = python
+PYTHON = python3
 
 ifneq ($(VERBOSE),1)
 TOOL_PREFIX := @$(TOOL_PREFIX)
 endif
 
-FLAGS  = -g -Os -nostdlib -std=gnu99 -iquote $(ROOT)/inc -I/usr/include -Wno-stringop-overflow
+FLAGS  = -g -Os -nostdlib -std=gnu99 -iquote $(ROOT)/inc
 FLAGS += -Wall -Werror -Wno-format -Wdeclaration-after-statement
 FLAGS += -Wstrict-prototypes -Wredundant-decls -Wnested-externs
 FLAGS += -fno-common -fno-exceptions -fno-strict-aliasing
 FLAGS += -mlittle-endian -mthumb -mcpu=cortex-m3 -mfloat-abi=soft
-FLAGS += -Wno-unused-value
+FLAGS += -Wno-unused-value -ffunction-sections
 
 ifneq ($(debug),y)
 FLAGS += -DNDEBUG

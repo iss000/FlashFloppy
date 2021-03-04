@@ -86,7 +86,6 @@ struct packed ff_cfg {
 #define HOST_dec        11
 #define HOST_tandy_coco 12
 #define HOST_fluke      13
-#define HOST_kaypro     14
 #define HOST_nascom     15
 #define HOST_casio      16
 #define HOST_ibm_3174   17
@@ -101,6 +100,7 @@ struct packed ff_cfg {
 #define DISPLAY_narrow   (1<<3)
 #define DISPLAY_ztech    (1<<4)
 #define DISPLAY_oled_64  (1<<5)
+#define DISPLAY_inverse  (1<<6)
 /* Only if DISPLAY_lcd: */
 #define _DISPLAY_lcd_columns 5
 #define DISPLAY_lcd_columns(x) ((x)<<_DISPLAY_lcd_columns)
@@ -138,7 +138,7 @@ struct packed ff_cfg {
     uint8_t head_settle_ms;
     uint8_t oled_contrast;
     char indexed_prefix[8];
-    uint8_t display_mode;
+    uint8_t _unused; /* never been used */
 #define SORT_never  0
 #define SORT_always 1
 #define SORT_small  2

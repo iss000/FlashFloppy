@@ -66,7 +66,6 @@ static bool_t xdf_check(const struct bpb *bpb);
 #define sec_sz(n) (128u << (n))
 
 #define _IAM 1 /* IAM */
-#define _ITN 1 /* inter-track numbering */
 #define _C(cyls) ((cyls) / 40 - 1)
 #define _R(rpm) ((rpm) / 60 - 5)
 #define _S(sides) ((sides) - 1)
@@ -78,7 +77,7 @@ const static struct raw_type {
     uint8_t interleave:3;
     uint8_t no:3;
     uint8_t base:1;
-    uint8_t inter_track_numbering:1;
+    uint8_t _pad:1;
     uint8_t cskew:4;
     uint8_t hskew:2;
     uint8_t cyls:1;
@@ -100,7 +99,7 @@ const static struct raw_type {
     { 11, _S(2), _IAM,  3, 2, 2, 1, 0, 0, 0, _C(80), _R(300) }, /* 880k */
     { 18, _S(2), _IAM, 84, 1, 2, 1, 0, 0, 0, _C(80), _R(300) }, /* 1.44M */
     { 19, _S(2), _IAM, 70, 1, 2, 1, 0, 0, 0, _C(80), _R(300) }, /* 1.52M */
-    { 21, _S(2), _IAM, 12, 2, 2, 1, 0, 0, 0, _C(80), _R(300) }, /* 1.68M */
+    { 21, _S(2), _IAM, 12, 2, 2, 1, 0, 3, 0, _C(80), _R(300) }, /* 1.68M */
     { 20, _S(2), _IAM, 40, 1, 2, 1, 0, 0, 0, _C(80), _R(300) }, /* 1.6M */
     { 36, _S(2), _IAM, 84, 1, 2, 1, 0, 0, 0, _C(80), _R(300) }, /* 2.88M */
     { 0 }
@@ -139,11 +138,6 @@ const static struct raw_type {
     { 0 }
 }, fluke_type[] = {
     { 16, _S(2), _IAM, 57, 2, 1, 0, 0, 0, 0, _C(80), _R(300) },
-    { 0 }
-}, kaypro_type[] = {
-    { 10, _S(1), _IAM, 30, 3, 2, 0, _ITN, 0, 0, _C(40), _R(300) }, /* 200k */
-    { 10, _S(2), _IAM, 30, 3, 2, 0, _ITN, 0, 0, _C(40), _R(300) }, /* 400k */
-    { 10, _S(2), _IAM, 30, 3, 2, 0, _ITN, 0, 0, _C(80), _R(300) }, /* 800k */
     { 0 }
 }, mbd_type[] = {
     { 11, _S(2), _IAM,  30, 1, 3, 1, 0, 0, 0, _C(80), _R(300) },
@@ -231,8 +225,6 @@ found:
     layout.gap3 = type->gap3;
     layout.interleave = type->interleave;
     layout.base[0] = layout.base[1] = type->base;
-    if (type->inter_track_numbering == _ITN)
-        layout.base[1] += type->nr_secs;
 
     simple_layout(im, &layout);
 
@@ -523,9 +515,6 @@ static bool_t img_open(struct image *im)
         break;
     case HOST_ibm_3174:
         return ibm_3174_open(im);
-    case HOST_kaypro:
-        type = kaypro_type;
-        break;
     case HOST_memotech:
         type = memotech_type;
         break;
@@ -880,6 +869,12 @@ static bool_t pc_dos_open(struct image *im)
      * Our caller will fall back to the XDF handler. */
     if ((bpb.sec_per_track == 23) && xdf_check(&bpb))
         goto fail;
+
+    /* Detect MSDMF layout, which requires interleave and skew. */
+    if ((bpb.sec_per_track == 21) && (no == 2)) {
+        layout.interleave = 2;
+        layout.cskew = 3;
+    }
 
     if ((bpb.num_heads != 1) && (bpb.num_heads != 2))
         goto fail;
@@ -2129,7 +2124,7 @@ static uint8_t *init_track_map(struct image *im)
     void *p;
 
     if ((im->nr_sides < 1) || (im->nr_sides > 2)
-        || (im->nr_cyls < 1) || (im->nr_cyls > 254))
+        || (im->nr_cyls < 1) || (im->nr_cyls > 255))
         F_die(FR_BAD_IMAGE);
 
     ASSERT(im->img.trk_info == NULL);
@@ -2509,8 +2504,18 @@ static void fm_prep_track(struct image *im)
         tracklen += enc_sec_sz(im, &im->img.sec_info[i]);
     tracklen *= 16;
 
-    /* Calculate data rate and track length. */
-    trk->data_rate = trk->data_rate ?: 125; /* SD */
+    if (trk->data_rate == 0) {
+        /* Infer the data rate:
+         * Micro-diskette = 125kbps, 8-inch disk = 250kbps */
+        for (i = 0; i < 1; i++) { /* 0=125kbps, 1=250kbps */
+            uint32_t maxlen = (((50000u * 300) / trk->rpm) << i) + 5000;
+            if (tracklen < maxlen)
+                break;
+        }
+        trk->data_rate = 125u << i; /* 125kbps or 250kbps */
+    }
+
+    /* Calculate standard track length from data rate and RPM. */
     im->tracklen_bc = (trk->data_rate * 400 * 300) / trk->rpm;
 
     /* Calculate a suitable GAP3 if not specified. */

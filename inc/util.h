@@ -146,10 +146,10 @@ uint16_t crc16_ccitt(const void *buf, size_t len, uint16_t crc);
 
 /* Display setup and identification. */
 void display_init(void);
-extern uint8_t display_mode;
-#define DM_NONE     0
-#define DM_LCD_OLED 1
-#define DM_LED_7SEG 2
+extern uint8_t display_type;
+#define DT_NONE     0
+#define DT_LCD_OLED 1
+#define DT_LED_7SEG 2
 
 /* Speaker. */
 void speaker_init(void);
@@ -189,7 +189,8 @@ void set_slot_name(const char *name);
 bool_t get_img_cfg(struct slot *slot);
 void IRQ_rotary(void);
 
-extern bool_t menu_mode;
+enum { DM_normal=0, DM_banner, DM_menu };
+extern uint8_t display_mode;
 extern uint8_t board_id;
 
 /* Gotek board revisions */
@@ -211,6 +212,7 @@ extern char _sbss[], _ebss[];
 
 /* Stacks. */
 extern uint32_t _thread_stacktop[], _thread_stackbottom[];
+extern uint32_t _thread1_stacktop[], _thread1_stackbottom[];
 extern uint32_t _irq_stacktop[], _irq_stackbottom[];
 
 /* Default exception handler. */

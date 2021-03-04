@@ -195,6 +195,16 @@ void floppy_cancel(void)
     barrier();
     drive_change_output(drv, outp_index, FALSE);
     drive_change_output(drv, outp_dskchg, TRUE);
+
+    /* Clean up I/O. This must avoid potential cancel_call()s while still
+     * getting volume communication into a consistent state. */
+    F_async_cancel_all();
+    /* cancel_call() circumvents the threading subsystem and may leave it in an
+     * incoherent state. Volume operations never cancel so it is safe to
+     * thread_yield() if a volume operation is in progress. */
+    while (volume_interrupt())
+        thread_yield();
+    thread_reset();
 }
 
 void floppy_set_fintf_mode(void)
@@ -298,6 +308,13 @@ void floppy_init(void)
     motor_chgrst_eject(drv);
 }
 
+static void io_thread_main(void *arg) {
+    while (1) {
+        F_async_drain();
+        thread_yield();
+    }
+}
+
 void floppy_insert(unsigned int unit, struct slot *slot)
 {
     struct image *im;
@@ -313,6 +330,7 @@ void floppy_insert(unsigned int unit, struct slot *slot)
         drive_change_output(drv, outp_hden, TRUE);
 
     timer_dma_init();
+    thread_start(&drv->io_thread, _thread1_stacktop, io_thread_main, NULL);
 
     /* Drive is ready. Set output signals appropriately. */
     update_amiga_id(drv, im->stk_per_rev > stk_ms(300));
@@ -430,6 +448,7 @@ static bool_t dma_rd_handle(struct drive *drv)
     switch (dma_rd->state) {
 
     case DMA_inactive: {
+        struct image *im = drv->image;
         time_t index_time, read_start_pos;
         unsigned int track;
         /* Allow 10ms from current rotational position to load new track */
@@ -450,17 +469,16 @@ static bool_t dma_rd_handle(struct drive *drv)
         read_start_pos = drv->index_suppressed
             ? drive.restart_pos /* start read exactly where write ended */
             : time_since(index_time) + delay;
-        read_start_pos %= drv->image->stk_per_rev;
+        read_start_pos %= im->stk_per_rev;
         /* Seek to the new track. */
         track = drive_calc_track(drv);
-        read_start_pos *= SYSCLK_MHZ/STK_MHZ;
-        if ((track >= (DA_FIRST_CYL*2)) && (drv->outp & m(outp_wrprot))
-            && !volume_readonly()) {
-            /* Remove write-protect when driven into D-A mode. */
-            drive_change_output(drv, outp_wrprot, FALSE);
-        }
-        if (image_setup_track(drv->image, track, &read_start_pos))
+        if (in_da_mode(im, track>>1) != image_in_da_mode(im)) {
+            /* Changing D-A mode requires changing image handler and may need
+             * to re-read the config file since D-A can change it. */
             return TRUE;
+        }
+        read_start_pos *= SYSCLK_MHZ/STK_MHZ;
+        image_setup_track(im, track, &read_start_pos);
         prefetch_start_time = time_now();
         read_start_pos /= SYSCLK_MHZ/STK_MHZ;
         sync_pos = read_start_pos;
@@ -468,7 +486,7 @@ static bool_t dma_rd_handle(struct drive *drv)
             /* Set the deadline to match existing index timing. */
             sync_time = index_time + read_start_pos;
             if (time_diff(time_now(), sync_time) < 0)
-                sync_time += drv->image->stk_per_rev;
+                sync_time += im->stk_per_rev;
         }
         /* Change state /then/ check for race against step or side change. */
         dma_rd->state = DMA_starting;
@@ -519,6 +537,7 @@ void floppy_get_track(struct track_info *ti)
     ti->side = active ? drive.head & (drive.image->nr_sides - 1) : 0;
     ti->sel = drive.sel;
     ti->writing = (active && dma_wr->state != DMA_inactive);
+    ti->in_da_mode = active ? in_da_mode(drive.image, ti->cyl) : FALSE;
 }
 
 static bool_t index_is_suppressed(struct drive *drv)
@@ -573,8 +592,6 @@ static void drive_step_timer(void *_drv)
         break;
     case STEP_latched:
         speaker_pulse();
-        if ((drv->cyl >= 84) && !drv->step.inward)
-            drv->cyl = 84; /* Fast step back from D-A cyls */
         drv->cyl += drv->step.inward ? 1 : -1;
         timer_set(&drv->step.timer,
                   drv->step.start + time_ms(ff_cfg.head_settle_ms));

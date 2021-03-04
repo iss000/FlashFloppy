@@ -44,6 +44,12 @@ static unsigned int enc_sec_sz(struct image *im)
     return im->da.idam_sz + im->da.dam_sz;
 }
 
+static bool_t da_open(struct image *im)
+{
+    im->nr_sides = 1;
+    return TRUE;
+}
+
 static void da_seek_track(struct image *im, uint16_t track)
 {
     struct da_status_sector *dass = &im->da.dass;
@@ -57,11 +63,11 @@ static void da_seek_track(struct image *im, uint16_t track)
     volume_cache_init(im->bufs.write_data.p + SEC_SZ + 2,
                       im->bufs.write_data.p + im->bufs.write_data.len);
 
-    switch (display_mode) {
-    case DM_LED_7SEG:
+    switch (display_type) {
+    case DT_LED_7SEG:
         led_7seg_write_string((led_7seg_nr_digits() == 3) ? "D-A" : "DA");
         break;
-    case DM_LCD_OLED:
+    case DT_LCD_OLED:
         lcd_write(0, 0, -1, "*Direct Access*");
         break;
     }
@@ -539,6 +545,7 @@ static void process_wdata(struct image *im, unsigned int sect, uint16_t crc)
 }
 
 const struct image_handler da_image_handler = {
+    .open = da_open,
     .setup_track = da_setup_track,
     .read_track = da_read_track,
     .rdata_flux = bc_rdata_flux,
