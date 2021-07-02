@@ -10,8 +10,6 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
-#define m(bitnr) (1u<<(bitnr))
-
 /* A DMA buffer for running a timer associated with a floppy-data I/O pin. */
 struct dma_ring {
     /* Current state of DMA (RDATA): 
@@ -80,8 +78,13 @@ static struct image *image;
 
 static struct {
     struct timer timer, timer_deassert;
+    struct timer custom_timer;
     time_t prev_time;
     bool_t fake_fired;
+    uint8_t custom_pulses_ver;
+    uint8_t custom_pulses_len;
+    /* Durations relative to track start. Must be in increasing order. */
+    time_t custom_pulses[MAX_CUSTOM_PULSES];
 } index;
 
 static unsigned int drive_calc_track(struct drive *drv);
@@ -188,25 +191,13 @@ static void floppy_mount(struct slot *slot)
 
         if (!async) {
             /* Large buffer to absorb write latencies at mass-storage layer. */
-            im->bufs.write_bc.len = 32*1024; /* 32kB, power of two. */
+            int ring_kb = (ram_kb >= 64) ? 32 : 8;
+            im->bufs.write_bc.len = ring_kb * 1024; /* power of two */
             im->bufs.write_bc.p = arena_alloc(im->bufs.write_bc.len);
         } else {
-            /* Make sure there is enough memory to fully buffer writes for an
-             * entire track. HFE is the least compact storage supported, with
-             * half the density of write_bc, so we use it as a worst-case.
-             */
-            uint32_t min_write_buffer = (200000/8 + 255) & ~255;
-            uint32_t for_data = arena_avail() & ~511;
-            uint32_t bc_len = 0;
-            if (for_data/2 < min_write_buffer) {
-                bc_len = min_write_buffer - for_data/2;
-                /* Round up to power of 2. */
-                bc_len = 1 << (sizeof(int)*8 - __builtin_clz(bc_len-1));
-            }
             /* Size at least 4kb so a 512 byte sector (1k bc) can be fully
              * encoded into the 2kb read_bc, with space to spare. */
-            bc_len = max_t(uint32_t, bc_len, 4*1024);
-            im->bufs.write_bc.len = bc_len; /* Power of two. */
+            im->bufs.write_bc.len = 4*1024; /* Power of two. */
             im->bufs.write_bc.p = arena_alloc(im->bufs.write_bc.len);
         }
 
@@ -246,8 +237,10 @@ static void floppy_mount(struct slot *slot)
                 image_open(im, slot, cltbl, FALSE);
             /* Now that the number of image cylinders is known, do a precise D-A
              * check. */
-            if (in_da_mode(im, cyl))
+            if (in_da_mode(im, cyl)) {
+                volume_cache_destroy(); /* Clean up after other image format. */
                 image_open(im, slot, cltbl, TRUE);
+            }
         }
 #endif
         if (async != im->disk_handler->async) {
@@ -280,6 +273,8 @@ static void floppy_mount(struct slot *slot)
 
     drv->index_suppressed = FALSE;
     index.prev_time = time_now();
+    index.custom_pulses_len = 0;
+    index.custom_pulses_ver = 0xFF;
 }
 
 /* Initialise timers and DMA for RDATA/WDATA. */
@@ -406,7 +401,7 @@ static void wdata_stop(void)
     image->wr_prod++;
 
 #if !defined(QUICKDISK)
-    if (!ff_cfg.index_suppression) {
+    if (!ff_cfg.index_suppression && ff_cfg.write_drain != WDRAIN_realtime) {
         /* Opportunistically insert an INDEX pulse ahead of writeback. */
         drive_change_output(drv, outp_index, TRUE);
         index.fake_fired = TRUE;
@@ -650,6 +645,28 @@ static void IRQ_rdata_dma(void)
         IRQx_set_pending(dma_rdata_irq);
     }
 
+    ASSERT(drv->image->index_pulses_len < MAX_CUSTOM_PULSES);
+    if (drv->image->index_pulses_ver != index.custom_pulses_ver) {
+        time_t current_pulse_pos = time_since(index.prev_time);
+        uint32_t oldpri;
+
+        oldpri = IRQ_save(TIMER_IRQ_PRI);
+        for (i = 0; i < drv->image->index_pulses_len; i++)
+            index.custom_pulses[i] = (drv->image->index_pulses[i]>>4)
+                / (SYSCLK_MHZ/TIME_MHZ);
+        index.custom_pulses_len = drv->image->index_pulses_len;
+        index.custom_pulses_ver = drv->image->index_pulses_ver;
+
+        for (i = 0; i < index.custom_pulses_len; i++)
+            if (current_pulse_pos <= index.custom_pulses[i])
+                break;
+        if (i < index.custom_pulses_len)
+            timer_set(&index.custom_timer, index.prev_time + index.custom_pulses[i]);
+        else
+            timer_cancel(&index.custom_timer);
+        IRQ_restore(oldpri);
+    }
+
     /* Check if we have crossed the index mark. If not, we're done. */
     if (image_ticks_since_index(drv->image) >= prev_ticks_since_index)
         return;
@@ -762,6 +779,14 @@ static void IRQ_wdata_dma(void)
     image->bufs.write_bc.prod = bc_prod;
     dma_wr->cons = cons;
     dma_wr->prev_sample = prev;
+}
+
+void floppy_sync(void)
+{
+    struct drive *drv = &drive;
+    struct image *im = drv->image;
+
+    image_sync(im);
 }
 
 /*

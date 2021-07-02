@@ -14,6 +14,7 @@ static void raw_setup_track(
     struct image *im, uint16_t track, uint32_t *start_pos);
 static bool_t raw_read_track(struct image *im);
 static bool_t raw_write_track(struct image *im);
+static void raw_sync(struct image *im);
 static bool_t raw_open(struct image *im);
 static void mfm_prep_track(struct image *im);
 static bool_t mfm_read_track(struct image *im);
@@ -62,6 +63,8 @@ static bool_t xdf_check(const struct bpb *bpb);
 #define LAYOUT_sequential      (1u<<0)
 #define LAYOUT_sides_swapped   (1u<<1)
 #define LAYOUT_reverse_side(x) (1u<<(2+(x)))
+
+#define BATCH_SIZE 256
 
 #define sec_sz(n) (128u << (n))
 
@@ -1474,6 +1477,7 @@ static void xdf_setup_track(
     }
 
     im->img.trk_off = (track>>1) * xdf_info->cyl_bytes;
+    im->img.trk_len = xdf_info->cyl_bytes;
     im->img.file_sec_offsets = xdf_info->file_sec_offsets[offs_sel];
 
     raw_setup_track(im, track, start_pos);
@@ -1485,6 +1489,8 @@ const struct image_handler img_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler d81_image_handler = {
@@ -1493,6 +1499,8 @@ const struct image_handler d81_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler st_image_handler = {
@@ -1501,6 +1509,8 @@ const struct image_handler st_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler adfs_image_handler = {
@@ -1509,6 +1519,8 @@ const struct image_handler adfs_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler atr_image_handler = {
@@ -1517,6 +1529,8 @@ const struct image_handler atr_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler mbd_image_handler = {
@@ -1525,6 +1539,8 @@ const struct image_handler mbd_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler mgt_image_handler = {
@@ -1533,6 +1549,8 @@ const struct image_handler mgt_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler pc98fdi_image_handler = {
@@ -1541,6 +1559,8 @@ const struct image_handler pc98fdi_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler pc98hdm_image_handler = {
@@ -1549,6 +1569,8 @@ const struct image_handler pc98hdm_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler trd_image_handler = {
@@ -1558,6 +1580,8 @@ const struct image_handler trd_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler opd_image_handler = {
@@ -1566,6 +1590,8 @@ const struct image_handler opd_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler ssd_image_handler = {
@@ -1575,6 +1601,8 @@ const struct image_handler ssd_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler dsd_image_handler = {
@@ -1584,6 +1612,8 @@ const struct image_handler dsd_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler sdu_image_handler = {
@@ -1592,6 +1622,8 @@ const struct image_handler sdu_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler jvc_image_handler = {
@@ -1600,6 +1632,8 @@ const struct image_handler jvc_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler vdk_image_handler = {
@@ -1608,6 +1642,8 @@ const struct image_handler vdk_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler ti99_image_handler = {
@@ -1616,6 +1652,8 @@ const struct image_handler ti99_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 const struct image_handler xdf_image_handler = {
@@ -1624,6 +1662,8 @@ const struct image_handler xdf_image_handler = {
     .read_track = raw_read_track,
     .rdata_flux = bc_rdata_flux,
     .write_track = raw_write_track,
+    .sync = raw_sync,
+    .async = TRUE,
 };
 
 
@@ -1664,17 +1704,48 @@ static unsigned int file_idx(
         : (_c * im->nr_sides) + _s;
 }
 
+static inline unsigned int calc_track_len(
+    struct image *im, unsigned int cyl, unsigned int side)
+{
+    struct raw_trk *trk =
+        &im->img.trk_info[im->img.trk_map[cyl*im->nr_sides + side]];
+    struct raw_sec *sec = &im->img.sec_info_base[trk->sec_off];
+    unsigned int off = 0;
+    for (unsigned int k = 0; k < trk->nr_sectors; k++) {
+        off += sec_sz(sec->n);
+        sec++;
+    }
+    return off;
+}
+
+static unsigned int calc_track_off(
+    struct image *im, unsigned int cyl, unsigned int side)
+{
+    unsigned int off = im->img.base_off;
+    unsigned int i, j;
+    unsigned int idx = file_idx(im, cyl, side);
+    for (i = 0; i < im->nr_cyls; i++) {
+        for (j = 0; j < im->nr_sides; j++) {
+            if (file_idx(im, i, j) >= idx)
+                continue;
+            off += calc_track_len(im, i, j);
+        }
+    }
+    return off;
+}
+
 static void raw_seek_track(
     struct image *im, uint16_t track, unsigned int cyl, unsigned int side)
 {
-    unsigned int i, j, k, pos, idx, off;
+    unsigned int i, pos;
     struct raw_trk *trk;
-    struct raw_sec *sec;
+    uint16_t old_track = im->cur_track;
+    uint32_t trk_off, trk_len;
+    uint32_t shadow_trk_off = 0, shadow_trk_len = 0;
 
     im->cur_track = track;
 
     /* Update image structure with info for this track. */
-    idx = cyl*im->nr_sides + side;
     trk = &im->img.trk_info[im->img.trk_map[cyl*im->nr_sides + side]];
     im->img.trk = trk;
     im->img.sec_info = &im->img.sec_info_base[trk->sec_off];
@@ -1701,23 +1772,72 @@ static void raw_seek_track(
         mfm_prep_track(im);
     }
 
-    if (im->img.file_sec_offsets == NULL) {
-        /* Find offset of track data in the image file. */
-        idx = file_idx(im, cyl, side);
-        off = im->img.base_off;
-        for (i = 0; i < im->nr_cyls; i++) {
-            for (j = 0; j < im->nr_sides; j++) {
-                if (file_idx(im, i, j) >= idx)
-                    continue;
-                trk = &im->img.trk_info[im->img.trk_map[i*im->nr_sides + j]];
-                sec = &im->img.sec_info_base[trk->sec_off];
-                for (k = 0; k < trk->nr_sectors; k++) {
-                    off += sec_sz(sec->n);
-                    sec++;
-                }
-            }
+    if (im->img.file_sec_offsets != NULL) {
+        /* Assume xdf, where track offset is the same for both side. */
+        trk_off = im->img.trk_off;
+        trk_len = im->img.trk_len;
+    } else {
+        trk_off = calc_track_off(im, cyl, 0);
+        trk_len = calc_track_len(im, cyl, 0);
+        if (im->nr_sides > 1) {
+            shadow_trk_off = calc_track_off(im, cyl, 1);
+            shadow_trk_len = calc_track_len(im, cyl, 1);
         }
-        im->img.trk_off = off;
+
+        im->img.shadow = side > 0;
+        if (im->img.shadow) {
+            im->img.trk_off = shadow_trk_off;
+            im->img.trk_len = shadow_trk_len;
+        } else {
+            im->img.trk_off = trk_off;
+            im->img.trk_len = trk_len;
+        }
+    }
+
+    /* Align to 512-byte block boundaries for ring_io, so im->img.trk_off/len
+     * is unchanged. This will generally have no effect because normally
+     * sec_sz*nr_sec is a multiple of 512. */
+    trk_len += trk_off % 512;
+    trk_off -= trk_off % 512;
+    trk_len = (trk_len + 511) & ~511;
+    shadow_trk_len += shadow_trk_off % 512;
+    shadow_trk_off -= shadow_trk_off % 512;
+    shadow_trk_len = (shadow_trk_len + 511) & ~511;
+
+    if (shadow_trk_len) {
+        bool_t disable_shadow = FALSE;
+        trk_len = shadow_trk_len = max_t(uint32_t, trk_len, shadow_trk_len);
+
+        /* Check if both sides fit in memory. We want to fully-buffer at least
+         * the current side. */
+        disable_shadow |= im->img.track_data.len < trk_len*2;
+        /* Check if the two sides overlap, which would confuse the ring. This
+         * implies tracks are not 512-byte aligned which we choose not to
+         * bother optimizing. */
+        if (trk_off < shadow_trk_off)
+            disable_shadow |= trk_off + trk_len > shadow_trk_off;
+        else
+            disable_shadow |= shadow_trk_off + shadow_trk_len > trk_off;
+        /* ED rate stresses reads too much to use shadow ring. */
+        disable_shadow |= trk->data_rate == /*ED*/ 1000;
+        if (disable_shadow) {
+            if (side > 1) {
+                trk_off = shadow_trk_off;
+                trk_len = shadow_trk_len;
+            }
+            shadow_trk_off = shadow_trk_len = 0;
+            im->img.shadow = FALSE;
+            old_track = ~track; /* Force re-init. */
+        }
+    }
+
+    if (old_track >> 1 != track >> 1) {
+        FSIZE_t shadow_off = shadow_trk_len > 0 ? shadow_trk_off : ~0;
+        ring_io_sync(&im->img.ring_io);
+        ring_io_shutdown(&im->img.ring_io);
+        ring_io_init(&im->img.ring_io, &im->fp, &im->img.track_data,
+                trk_off, shadow_off, trk_len / 512);
+        im->img.ring_io.batch_secs = 2;
     }
 }
 
@@ -1763,9 +1883,9 @@ static uint32_t calc_start_pos(struct image *im)
                     im->img.decode_pos++;
                     if (decode_off < sec_sz(sec->n)) {
                         /* Data */
-                        im->img.rd_sec_pos = decode_off / 1024;
+                        im->img.rd_sec_pos = decode_off / BATCH_SIZE;
                         im->img.decode_data_pos = im->img.rd_sec_pos;
-                        decode_off %= 1024;
+                        decode_off %= BATCH_SIZE;
                     } else {
                         /* Post Data */
                         decode_off -= sec_sz(sec->n);
@@ -1778,8 +1898,8 @@ static uint32_t calc_start_pos(struct image *im)
         } else {
             /* Pre-index track gap */
             im->img.decode_pos = trk->nr_sectors * 4 + 1;
-            im->img.decode_data_pos = decode_off / 1024;
-            decode_off %= 1024;
+            im->img.decode_data_pos = decode_off / BATCH_SIZE;
+            decode_off %= BATCH_SIZE;
         }
     }
 
@@ -1807,24 +1927,26 @@ static void raw_setup_track(
     im->cur_ticks = im->cur_bc * im->ticks_per_cell;
     im->ticks_since_flux = 0;
 
-    decode_off = calc_start_pos(im);
-
     rd->prod = rd->cons = 0;
     bc->prod = bc->cons = 0;
 
     if (start_pos) {
-        image_read_track(im);
-        bc->cons = decode_off * 16;
+        decode_off = calc_start_pos(im);
+
+        im->img.trash_bc = decode_off * 16;
         *start_pos = sys_ticks;
+    } else {
+        im->img.decode_pos = 0;
     }
 }
 
 static bool_t raw_open(struct image *im)
 {
-    volume_cache_init(im->bufs.write_data.p + 1024,
-                      im->img.heap_bottom);
+    im->img.track_data.p = im->bufs.write_data.p + BATCH_SIZE;
+    im->img.track_data.len = im->img.heap_bottom - im->img.track_data.p;
 
     /* Initialise write_bc_ticks (used by floppy_insert to set outp_hden). */
+    im->cur_track = ~0;
     raw_seek_track(im, 0, 0, 0);
 
     return TRUE;
@@ -1888,11 +2010,9 @@ static bool_t raw_write_track(struct image *im)
     unsigned int bufmask = (wr->len / 2) - 1;
     uint8_t *wrbuf = im->bufs.write_data.p;
     uint32_t c = wr->cons / 16, p = wr->prod / 16;
+    struct image_buf *td = &im->img.track_data;
     struct raw_sec *sec;
-    unsigned int i, off;
-    time_t t;
-    uint16_t crc;
-    uint8_t idam_r, x;
+    unsigned int i;
 
     /* If we are processing final data then use the end index, rounded up. */
     barrier();
@@ -1900,43 +2020,50 @@ static bool_t raw_write_track(struct image *im)
     if (flush)
         p = (write->bc_end + 15) / 16;
 
-    while ((int16_t)(p - c) > 128) {
-
-        uint32_t sc = c;
-
-        if (im->sync == SYNC_fm) {
-
-            uint16_t sync;
-            if (buf[c++ & bufmask] != 0xaaaa)
-                continue;
-            sync = buf[c & bufmask];
-            if (mfmtobin(sync >> 1) != FM_SYNC_CLK)
-                continue;
-            x = mfmtobin(sync);
-            c++;
-
-        } else { /* MFM */
-
-            if (be16toh(buf[c++ & bufmask]) != 0x4489)
-                continue;
-            if ((x = mfmtobin(buf[c & bufmask])) == 0xa1)
-                continue;
-            c++;
-
-        }
-
-        switch (x) {
-
-        case 0xfe: /* IDAM */
+    while ((int16_t)(p - c) > 1) { /* At least 2 bytes. */
+        if (im->img.decode_pos == 0) {
+            uint8_t x;
             if (im->sync == SYNC_fm) {
-                wrbuf[0] = x;
+
+                uint16_t sync;
+                if (buf[c++ & bufmask] != 0xaaaa)
+                    continue;
+                sync = buf[c & bufmask];
+                if (mfmtobin(sync >> 1) != FM_SYNC_CLK)
+                    continue;
+                x = mfmtobin(sync);
+                c++;
+
+            } else { /* MFM */
+
+                if (be16toh(buf[c++ & bufmask]) != 0x4489)
+                    continue;
+                if ((x = mfmtobin(buf[c & bufmask])) == 0xa1)
+                    continue;
+                c++;
+
+            }
+
+            if (x == 0xfe) /* IDAM */
+                im->img.decode_pos = 1;
+            else if (x == 0xfb) /* DAM */
+                im->img.decode_pos = 2;
+
+        } else if (im->img.decode_pos == 1) {
+            /* ID record, shy address mark */
+            uint8_t idam_r;
+            uint16_t crc;
+            if (p - c < 4 + 2)
+                break;
+            if (im->sync == SYNC_fm) {
+                wrbuf[0] = 0xfe;
                 for (i = 1; i < 7; i++)
                     wrbuf[i] = mfmtobin(buf[c++ & bufmask]);
                 idam_r = wrbuf[3];
             } else { /* MFM */
                 for (i = 0; i < 3; i++)
                     wrbuf[i] = 0xa1;
-                wrbuf[i++] = x;
+                wrbuf[i++] = 0xfe;
                 for (; i < 10; i++)
                     wrbuf[i] = mfmtobin(buf[c++ & bufmask]);
                 idam_r = wrbuf[6];
@@ -1944,7 +2071,8 @@ static bool_t raw_write_track(struct image *im)
             crc = crc16_ccitt(wrbuf, i, 0xffff);
             if (crc != 0) {
                 printk("IMG IDAM Bad CRC: %04x, %u\n", crc, idam_r);
-                break;
+                im->img.decode_pos = 0;
+                continue;
             }
             /* Search by sector id for this sector's logical order. */
             for (i = 0, sec = im->img.sec_info;
@@ -1956,72 +2084,99 @@ static bool_t raw_write_track(struct image *im)
                 printk("IMG IDAM Bad Sector: %02x\n", idam_r);
                 im->img.write_sector = -2;
             }
-            break;
-
-        case 0xfb: /* DAM */ {
-            unsigned int nr, todo, sec_sz;
+            im->img.decode_data_pos = 0;
+            im->img.decode_pos = 0;
+        } else if (im->img.decode_pos == 2) {
+            /* Data record, shy address mark */
+            unsigned int sec_sz;
             int sec_nr = im->img.write_sector;
 
             if (sec_nr < 0) {
-                if (sec_nr == -1)
+                if (sec_nr == -1) {
                     sec_nr = raw_find_first_write_sector(im, write, trk);
+                    im->img.write_sector = sec_nr;
+                    im->img.decode_data_pos = 0;
+                }
                 if (sec_nr < 0) {
                     printk("IMG DAM Unknown\n");
-                    goto dam_out;
+                    im->img.write_sector = -2;
+                    im->img.decode_pos = 0;
+                    continue;
                 }
             }
 
             sec_sz = sec_sz(im->img.sec_info[sec_nr].n);
-            if ((int16_t)(p - c) < (sec_sz + 2)) {
-                c = sc;
-                goto out;
+
+            if (!im->img.decode_data_pos) {
+                unsigned int off;
+                if (p - c < 4) /* Will we able to increment decode_data_pos? */
+                    break;
+                im->img.crc = (im->sync == SYNC_fm) ? FM_DAM_CRC : MFM_DAM_CRC;
+
+                sec = &im->img.sec_info[sec_nr];
+
+                if (im->img.file_sec_offsets) {
+                    off = im->img.file_sec_offsets[sec_nr];
+                } else {
+                    sec = im->img.sec_info;
+                    for (i = off = 0; i < sec_nr; i++)
+                        off += sec_sz(sec++->n);
+                }
+                off += im->img.trk_off % 512;
+                ring_io_seek(&im->img.ring_io, off, TRUE, im->img.shadow);
+                printk("Write %u[%02x]/%u\n", sec_nr, sec->r, trk->nr_sectors);
             }
 
-            crc = (im->sync == SYNC_fm) ? FM_DAM_CRC : MFM_DAM_CRC;
+            if (im->img.decode_data_pos < sec_sz) {
+                unsigned int nr;
+                uint32_t idx = ring_io_idx(&im->img.ring_io, td->cons);
+                nr = sec_sz - im->img.decode_data_pos;
+                nr = min_t(unsigned int, nr,
+                        ring_io_idxend(&im->img.ring_io) - idx);
+                /* Keep alignment for process_data(). */
+                if (nr && p - c < 4)
+                    break;
+                nr = min_t(unsigned int, nr, (p - c) & ~3);
 
-            sec = &im->img.sec_info[sec_nr];
-            printk("Write %u[%02x]/%u... ", sec_nr, sec->r, trk->nr_sectors);
-            t = time_now();
+                /* It should be quite rare to wait on the read, as that'd be
+                 * like a buffer underrun during normal reading. */
+                if (td->cons + nr > td->prod)
+                    break;
 
-            if (im->img.file_sec_offsets) {
-                off = im->img.file_sec_offsets[sec_nr];
-            } else {
-                sec = im->img.sec_info;
-                for (i = off = 0; i < sec_nr; i++)
-                    off += sec_sz(sec++->n);
-            }
-            F_lseek(&im->fp, im->img.trk_off + off);
-
-            for (todo = sec_sz; todo != 0; todo -= nr) {
-                nr = min_t(unsigned int, todo, 1024);
-                mfm_ring_to_bin(buf, bufmask, c, wrbuf, nr);
+                mfm_ring_to_bin(buf, bufmask, c, td->p + idx, nr);
                 c += nr;
-                crc = crc16_ccitt(wrbuf, nr, crc);
-                process_data(im, wrbuf, nr);
-                F_write(&im->fp, wrbuf, nr, NULL);
+                im->img.crc = crc16_ccitt(td->p + idx, nr, im->img.crc);
+                process_data(im, td->p + idx, nr);
+                td->cons += nr;
+                im->img.decode_data_pos += nr;
+                if (im->img.decode_data_pos == sec_sz)
+                    ring_io_flush(&im->img.ring_io);
             }
 
-            printk("%u us\n", time_diff(t, time_now()) / TIME_MHZ);
+            if (im->img.decode_data_pos < sec_sz)
+                continue;
 
+            if (p - c < 2)
+                break;
             mfm_ring_to_bin(buf, bufmask, c, wrbuf, 2);
             c += 2;
-            crc = crc16_ccitt(wrbuf, 2, crc);
-            if (crc != 0) {
-                printk("IMG Bad CRC: %04x, %u[%02x]\n",
-                       crc, sec_nr, sec->r);
-            }
-
-            dam_out:
+            im->img.crc = crc16_ccitt(wrbuf, 2, im->img.crc);
+            if (im->img.crc != 0)
+                printk("IMG Bad CRC: %04x\n", im->img.crc);
             im->img.write_sector = -2;
-            break;
-        }
-
+            im->img.decode_pos = 0;
         }
     }
 
-out:
+    ring_io_progress(&im->img.ring_io);
     wr->cons = c * 16;
     return flush;
+}
+
+static void raw_sync(struct image *im)
+{
+    ring_io_sync(&im->img.ring_io);
+    ring_io_shutdown(&im->img.ring_io);
 }
 
 static void raw_dump_info(struct image *im)
@@ -2062,7 +2217,7 @@ static void img_fetch_data(struct image *im)
     uint8_t sec_i;
     uint16_t off, len;
 
-    if ((im->img.trk->nr_sectors == 0) || (rd->prod != rd->cons))
+    if (im->img.trk->nr_sectors == 0)
         return;
 
     sec_i = im->img.sec_map[im->img.trk_sec];
@@ -2078,11 +2233,21 @@ static void img_fetch_data(struct image *im)
 
     len = sec_sz(sec->n);
 
-    off += im->img.rd_sec_pos * 1024;
-    len -= im->img.rd_sec_pos * 1024;
+    off += im->img.rd_sec_pos * BATCH_SIZE;
+    len -= im->img.rd_sec_pos * BATCH_SIZE;
 
-    if (len > 1024) {
-        len = 1024;
+    off += im->img.trk_off % 512;
+    ring_io_seek(&im->img.ring_io, off, FALSE, im->img.shadow);
+    ring_io_progress(&im->img.ring_io);
+
+    if (rd->prod != rd->cons)
+        return;
+    if (im->img.track_data.cons + min_t(uint16_t, len, BATCH_SIZE)
+            > im->img.track_data.prod)
+        return;
+
+    if (len > BATCH_SIZE) {
+        len = BATCH_SIZE;
         im->img.rd_sec_pos++;
     } else {
         im->img.rd_sec_pos = 0;
@@ -2090,8 +2255,16 @@ static void img_fetch_data(struct image *im)
             im->img.trk_sec = 0;
     }
 
-    F_lseek(&im->fp, im->img.trk_off + off);
-    F_read(&im->fp, buf, len, NULL);
+    for (uint16_t todo = len; todo > 0;) {
+        uint32_t idx = ring_io_idx(&im->img.ring_io, im->img.track_data.cons);
+        uint32_t idxend = ring_io_idxend(&im->img.ring_io);
+        uint16_t tocopy = min_t(uint16_t, todo, idxend - idx);
+        ASSERT(idx % 4 == 0);
+        ASSERT(tocopy % 32 == 0);
+        memcpy_fast(buf, im->img.track_data.p + idx, tocopy);
+        im->img.track_data.cons += tocopy;
+        todo -= tocopy;
+    }
     process_data(im, buf, len);
 
     rd->prod++;
@@ -2105,15 +2278,15 @@ static void *align_p(void *p)
 static void check_p(void *p, struct image *im)
 {
     uint8_t *a = p, *b = (uint8_t *)im->bufs.read_data.p;
-    if ((int32_t)(a-b) < 1024)
+    if ((int32_t)(a-b) < BATCH_SIZE)
         F_die(FR_BAD_IMAGE);
     im->img.heap_bottom = p;
 }
 
 /* Initialise track/sector-info structures at the top of the heap. 
  * In ascending address order: 
- * {read,write}_data (truncated to 1024 bytes)
- * ... [volume cache]
+ * {read,write}_data (truncated to BATCH_SIZE bytes)
+ * ... [ring cache]
  * im->img.trk_info (trk_map[] points into here)
  * im->img.sec_info_base (trk_info[] + sec_map[] point into here)
  * im->img.sec_map (Sector info = sec_info[sec_map[sector#]])
@@ -2337,6 +2510,9 @@ static bool_t mfm_read_track(struct image *im)
 
     img_fetch_data(im);
 
+    if (im->img.trk->nr_sectors != 0 && rd->prod == rd->cons)
+        return FALSE; /* Wait for read to complete. */
+
     /* Generate some MFM if there is space in the raw-bitcell ring buffer. */
     bc_p = bc->prod / 16; /* MFM words */
     bc_c = bc->cons / 16; /* MFM words */
@@ -2369,11 +2545,11 @@ static bool_t mfm_read_track(struct image *im)
         }
     } else if (im->img.decode_pos == (trk->nr_sectors * 4 + 1)) {
         /* Pre-index track gap */
-        uint16_t sz = im->img.gap_4 - im->img.decode_data_pos * 1024;
-        if (bc_space < min_t(unsigned int, sz, 1024))
+        uint16_t sz = im->img.gap_4 - im->img.decode_data_pos * BATCH_SIZE;
+        if (bc_space < min_t(unsigned int, sz, BATCH_SIZE))
             return FALSE;
-        if (sz > 1024) {
-            sz = 1024;
+        if (sz > BATCH_SIZE) {
+            sz = BATCH_SIZE;
             im->img.decode_data_pos++;
             im->img.decode_pos--;
         } else {
@@ -2421,11 +2597,11 @@ static bool_t mfm_read_track(struct image *im)
         }
         case 2: /* Data */ {
             uint16_t sec_sz = sec_sz(sec->n);
-            sec_sz -= im->img.decode_data_pos * 1024;
-            if (bc_space < min_t(unsigned int, sec_sz, 1024))
+            sec_sz -= im->img.decode_data_pos * BATCH_SIZE;
+            if (bc_space < min_t(unsigned int, sec_sz, BATCH_SIZE))
                 return FALSE;
-            if (sec_sz > 1024) {
-                sec_sz = 1024;
+            if (sec_sz > BATCH_SIZE) {
+                sec_sz = BATCH_SIZE;
                 im->img.decode_data_pos++;
                 im->img.decode_pos--;
             } else {
@@ -2455,6 +2631,11 @@ static bool_t mfm_read_track(struct image *im)
 #undef emit_raw
 #undef emit_byte
 
+    if (im->img.trash_bc) {
+        int16_t to_consume = min_t(uint16_t, (bc_p - bc_c)*16, im->img.trash_bc);
+        im->img.trash_bc -= to_consume;
+        bc->cons += to_consume;
+    }
     im->img.decode_pos++;
     bc->prod = bc_p * 16;
 
@@ -2554,6 +2735,9 @@ static bool_t fm_read_track(struct image *im)
 
     img_fetch_data(im);
 
+    if (im->img.trk->nr_sectors != 0 && rd->prod == rd->cons)
+        return FALSE; /* Wait for read to complete. */
+
     /* Generate some FM if there is space in the raw-bitcell ring buffer. */
     bc_p = bc->prod / 16; /* FM words */
     bc_c = bc->cons / 16; /* FM words */
@@ -2582,11 +2766,11 @@ static bool_t fm_read_track(struct image *im)
         }
     } else if (im->img.decode_pos == (trk->nr_sectors * 4 + 1)) {
         /* Pre-index track gap */
-        uint16_t sz = im->img.gap_4 - im->img.decode_data_pos * 1024;
-        if (bc_space < min_t(unsigned int, sz, 1024))
+        uint16_t sz = im->img.gap_4 - im->img.decode_data_pos * BATCH_SIZE;
+        if (bc_space < min_t(unsigned int, sz, BATCH_SIZE))
             return FALSE;
-        if (sz > 1024) {
-            sz = 1024;
+        if (sz > BATCH_SIZE) {
+            sz = BATCH_SIZE;
             im->img.decode_data_pos++;
             im->img.decode_pos--;
         } else {
@@ -2628,11 +2812,11 @@ static bool_t fm_read_track(struct image *im)
         }
         case 2: /* Data */ {
             uint16_t sec_sz = sec_sz(sec->n);
-            sec_sz -= im->img.decode_data_pos * 1024;
-            if (bc_space < min_t(unsigned int, sec_sz, 1024))
+            sec_sz -= im->img.decode_data_pos * BATCH_SIZE;
+            if (bc_space < min_t(unsigned int, sec_sz, BATCH_SIZE))
                 return FALSE;
-            if (sec_sz > 1024) {
-                sec_sz = 1024;
+            if (sec_sz > BATCH_SIZE) {
+                sec_sz = BATCH_SIZE;
                 im->img.decode_data_pos++;
                 im->img.decode_pos--;
             } else {
@@ -2660,6 +2844,11 @@ static bool_t fm_read_track(struct image *im)
 #undef emit_raw
 #undef emit_byte
 
+    if (im->img.trash_bc) {
+        int16_t to_consume = min_t(uint16_t, (bc_p - bc_c)*16, im->img.trash_bc);
+        im->img.trash_bc -= to_consume;
+        bc->cons += to_consume;
+    }
     im->img.decode_pos++;
     bc->prod = bc_p * 16;
 

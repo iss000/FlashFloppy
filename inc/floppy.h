@@ -33,21 +33,46 @@
 
 #define verbose_image_log FALSE
 
+struct image_buf {
+    void *p;
+    uint32_t len;
+    uint32_t prod, cons;
+};
+
+struct image_bufs {
+    /* Buffering for bitcells being written to disk. */
+    struct image_buf write_bc;
+    /* Buffering for bitcells we generate from read_data. */
+    struct image_buf read_bc;
+    /* Staging area for writeout to mass storage. */
+    struct image_buf write_data;
+    /* Read buffer for track data to be used for generating flux pattern. */
+    struct image_buf read_data;
+};
+
 struct adf_image {
-    uint32_t trk_off;
+    struct ring_io ring_io;
     uint32_t sec_idx;
     int32_t decode_pos;
     uint32_t pre_idx_gap_bc;
     uint32_t nr_secs;
     uint32_t written_secs;
+    uint16_t trash_bc; /* Number of bitcells to throw away. */
     uint8_t sec_map[2][22];
+    struct image_buf write_buffer;
+    uint16_t *write_offsets; /* File offset of each 512 byte buffer segment */
+    FOP write_op;
+    uint8_t write_cnt;
+    uint8_t sync_state;
+    bool_t ring_io_inited;
 };
 
 struct hfe_image {
     struct ring_io ring_io;
     uint16_t tlut_base;
     uint16_t trk_pos, trk_len;
-    bool_t is_v3, double_step;
+    bool_t is_v3, double_step, fresh_seek;
+    uint8_t next_index_pulses_pos;
 };
 
 struct qd_image {
@@ -84,6 +109,9 @@ struct raw_trk {
 
 struct img_image {
     uint32_t trk_off, base_off;
+    /* Length on-disk that encompases all track data. May contain other data
+     * (e.g., the other side of the cylinder). */
+    uint32_t trk_len;
     uint16_t trk_sec, rd_sec_pos;
     int32_t decode_pos;
     uint16_t decode_data_pos, crc;
@@ -99,9 +127,13 @@ struct img_image {
     /* Delay start of track this many bitcells past index. */
     uint32_t track_delay_bc;
     uint16_t gap_4;
+    uint8_t shadow;
+    uint16_t trash_bc; /* Number of bitcells to throw away. */
     uint32_t idx_sz, idam_sz;
     uint16_t dam_sz_pre, dam_sz_post;
     void *heap_bottom;
+    struct image_buf track_data;
+    struct ring_io ring_io;
 };
 
 struct dsk_image {
@@ -123,24 +155,18 @@ struct directaccess {
     int32_t decode_pos;
     uint16_t trk_sec;
     uint16_t idx_sz, idam_sz, dam_sz;
+    uint16_t trash_bc; /* Number of bitcells to throw away. */
+    uint8_t *rd_buf;
+    FOP read_op;
+    struct image_buf write_buffer;
+    LBA_t *write_offsets; /* Disk offset of each 512 byte buffer segment */
+    FOP write_op;
+    uint8_t write_cnt;
+    uint8_t sync_state;
+    bool_t read_op_started;
 };
 
-struct image_buf {
-    void *p;
-    uint32_t len;
-    uint32_t prod, cons;
-};
-
-struct image_bufs {
-    /* Buffering for bitcells being written to disk. */
-    struct image_buf write_bc;
-    /* Buffering for bitcells we generate from read_data. */
-    struct image_buf read_bc;
-    /* Staging area for writeout to mass storage. */
-    struct image_buf write_data;
-    /* Read buffer for track data to be used for generating flux pattern. */
-    struct image_buf read_data;
-};
+#define MAX_CUSTOM_PULSES 34 /* 33+1 for minor track misalignment */
 
 struct image {
     /* Handler for currently-selected type of disk image. */
@@ -154,6 +180,11 @@ struct image {
 
     /* Info about image as a whole. */
     uint8_t nr_cyls, nr_sides;
+    uint8_t index_pulses_ver; /* Changed when pulses or length changed. */
+    uint8_t index_pulses_len;
+    /* Alternative index pulse locations, in ticks. When non-empty, disables
+     * regular index pulse. */
+    uint32_t index_pulses[MAX_CUSTOM_PULSES];
 
     /* Data buffers. */
     struct image_bufs bufs;
@@ -203,6 +234,7 @@ struct image_handler {
     bool_t (*read_track)(struct image *im);
     uint16_t (*rdata_flux)(struct image *im, uint16_t *tbuf, uint16_t nr);
     bool_t (*write_track)(struct image *im);
+    void (*sync)(struct image *im);
 
     bool_t async;
 };
@@ -245,6 +277,10 @@ uint16_t bc_rdata_flux(struct image *im, uint16_t *tbuf, uint16_t nr);
  * was completed for the write at the tail of the pipeline. */
 bool_t image_write_track(struct image *im);
 
+/* Sync track data from memory to mass storage. Only useful to call when normal
+ * processing may be interrupted, like before floppy_cancel(). */
+void image_sync(struct image *im);
+
 /* Rotational position of last-generated flux (SYSCLK ticks past index). */
 uint32_t image_ticks_since_index(struct image *im);
 
@@ -266,6 +302,7 @@ uint16_t fm_sync(uint8_t dat, uint8_t clk);
 void floppy_init(void);
 bool_t floppy_ribbon_is_reversed(void);
 void floppy_insert(unsigned int unit, struct slot *slot);
+void floppy_sync(void);
 void floppy_cancel(void);
 bool_t floppy_handle(void); /* TRUE -> re-read config file */
 void floppy_set_cyl(uint8_t unit, uint8_t cyl);

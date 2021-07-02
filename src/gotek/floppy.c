@@ -48,7 +48,7 @@ void IRQ_12(void) __attribute__((alias("IRQ_wdata_dma")));
 void IRQ_13(void) __attribute__((alias("IRQ_rdata_dma")));
 
 /* EXTI IRQs. */
-/*void IRQ_6(void) __attribute__((alias("IRQ_SELA_changed")));*/ /* EXTI0 */
+void IRQ_6(void) __attribute__((alias("IRQ_SELA_changed"))); /* EXTI0 */
 void IRQ_7(void) __attribute__((alias("IRQ_STEP_changed"))); /* EXTI1 */
 void IRQ_10(void) __attribute__((alias("IRQ_SIDE_changed"))); /* EXTI4 */
 void IRQ_23(void) __attribute__((alias("IRQ_WGATE_changed"))); /* EXTI9_5 */
@@ -89,8 +89,8 @@ static void board_floppy_init(void)
     gpio_configure_pin(gpiob, pin_wgate, GPI_bus);
     gpio_configure_pin(gpiob, pin_side,  GPI_bus);
 
-    /* PA[15:14], PB[13:12], PC[11:10], PB[9:2], PA[1:0] */
-    afio->exticr4 = 0x0011;
+    /* PA[15:12], PC[11:10], PB[9:2], PA[1:0] */
+    afio->exticr4 = 0x0000;
     afio->exticr3 = 0x2211;
     afio->exticr2 = 0x1111;
     afio->exticr1 = 0x1100;
@@ -107,8 +107,8 @@ static void board_floppy_init(void)
     }
 
     pins = m(pin_wgate) | m(pin_side) | m(pin_sel0);
-    exti->rtsr = pins | m(pin_motor) | m(pin_step) | m(11) | m(10);
-    exti->ftsr = pins | m(pin_motor) | m(pin_chgrst) | m(11) | m(10);
+    exti->rtsr = pins | m(pin_motor) | m(pin_step) | FULL_ROTARY_MASK;
+    exti->ftsr = pins | m(pin_motor) | m(pin_chgrst) | FULL_ROTARY_MASK;
     exti->imr = pins | m(pin_step);
 }
 
@@ -118,23 +118,18 @@ static void board_floppy_init(void)
  * Note that the entirety of the SELA handler is in SRAM (.data) -- not only 
  * is this faster to execute, but allows us to co-locate gpio_out_active for 
  * even faster access in the time-critical speculative entry point. */
-void IRQ_SELA_changed(void);
-asm (
-"    .data\n"
-"    .align 4\n"
-"    .thumb_func\n"
-"    .type IRQ_SELA_changed,%function\n"
-"IRQ_SELA_changed:\n"
-"    ldr  r0, [pc, #4]\n" /* r0 = gpio_out_active */
-"    ldr  r1, [pc, #8]\n" /* r1 = &gpio_out->b[s]rr */
-"    str  r0, [r1, #0]\n" /* gpio_out->b[s]rr = gpio_out_active */
-"    b.n  _IRQ_SELA_changed\n" /* branch to the main ISR entry point */
-"gpio_out_active:   .word 0\n"
-"gpio_out_setreset: .word 0x40010c10\n" /* gpio_out->b[s]rr */
-"    .global IRQ_6\n"
-"    .thumb_set IRQ_6,IRQ_SELA_changed\n"
-"    .previous\n"
-);
+__attribute__((naked)) __attribute__((section(".data@")))
+void IRQ_SELA_changed(void) {
+    asm (
+        ".global gpio_out_active, gpio_out_setreset\n"
+        "    ldr  r0, [pc, #4]\n" /* r0 = gpio_out_active */
+        "    ldr  r1, [pc, #8]\n" /* r1 = &gpio_out->b[s]rr */
+        "    str  r0, [r1, #0]\n" /* gpio_out->b[s]rr = gpio_out_active */
+        "    b.n  _IRQ_SELA_changed\n" /* branch to the main ISR entry point */
+        "gpio_out_active:   .word 0\n"
+        "gpio_out_setreset: .word 0x40010c10\n" /* gpio_out->b[s]rr */
+        );
+}
 
 /* Subset of output pins which are active (O_TRUE). */
 extern uint32_t gpio_out_active;
@@ -269,7 +264,8 @@ static void IRQ_STEP_changed(void)
         drive_change_output(drv, outp_trk0, FALSE);
     if (dma_rd != NULL) {
         rdata_stop();
-        if (!ff_cfg.index_suppression) {
+        if (!ff_cfg.index_suppression
+                && ff_cfg.track_change != TRKCHG_realtime) {
             /* Opportunistically insert an INDEX pulse ahead of seek op. */
             drive_change_output(drv, outp_index, TRUE);
             index.fake_fired = TRUE;
@@ -361,10 +357,11 @@ static void IRQ_MOTOR_CHGRST(void)
 {
     struct drive *drv = &drive;
     bool_t changed = drv->motor.changed;
-    uint32_t pr = exti->pr;
+    uint32_t rot_mask, pr = exti->pr;
 
+    rot_mask = board_get_rotary_mask();
     drv->motor.changed = FALSE;
-    exti->pr = m(pin_motor) | m(pin_chgrst) | m(11) | m(10);
+    exti->pr = pr & (m(pin_motor) | m(pin_chgrst) | rot_mask);
 
     if ((pr & m(pin_motor)) || changed)
         IRQ_MOTOR(drv);
@@ -372,7 +369,7 @@ static void IRQ_MOTOR_CHGRST(void)
     if ((pr & m(pin_chgrst)) || changed)
         IRQ_CHGRST(drv);
 
-    if (pr & (m(11) | m(10)))
+    if (pr & rot_mask)
         IRQ_rotary();
 }
 

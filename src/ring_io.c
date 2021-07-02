@@ -20,23 +20,33 @@
 static void enqueue_io(struct ring_io *rio);
 
 void ring_io_init(struct ring_io *rio, FIL *fp, struct image_buf *read_data,
-        FSIZE_t off, uint16_t sec_len, uint8_t batch_secs,
-        uint8_t trailing_secs)
+        FSIZE_t off, FSIZE_t shadow_off, uint16_t sec_len)
 {
+    ASSERT(off % 512 == 0);
+    ASSERT(shadow_off == ~0 || shadow_off % 512 == 0);
     memset(rio, 0, sizeof(*rio));
     rio->fp = fp;
     rio->read_data = read_data;
     rio->f_off = off;
+    rio->f_shadow_off = shadow_off;
     rio->f_len = sec_len * 512;
     rio->ring_len = sec_len * 512;
-    // FIXME: this doesn't allow image driver to 'steal' space from read_data
-    if (rio->ring_len > read_data->len)
-        rio->ring_len = read_data->len & ~511;
+    if (shadow_off == ~0) {
+        if (rio->ring_len > read_data->len)
+            rio->ring_len = read_data->len & ~511;
+    } else {
+        ASSERT(off < shadow_off ? off + sec_len*512 <= shadow_off
+                                : shadow_off + sec_len*512 <= off);
+        if (rio->ring_len*2 > read_data->len)
+            rio->ring_len = (read_data->len / 2) & ~511;
+    }
     rio->ring_off = RING_INIT;
-    rio->batch_secs = batch_secs;
-    rio->trailing_len = trailing_secs * 512;
+    rio->batch_secs = 1;
+    rio->trailing_secs = 0;
     ASSERT(rio->ring_len <= RING_IO_MAX_RING_LEN);
-    ASSERT(rio->ring_len >= (rio->batch_secs * 2 + trailing_secs) * 512);
+
+    for (int i = 0; i < rio->ring_len / 512 << (shadow_off == ~0 ? 0 : 1); i++)
+        BIT_SET(rio->unread_bitfield, i);
 }
 
 static void progress_io(struct ring_io *rio)
@@ -67,13 +77,6 @@ static void sync_complete(struct ring_io *rio)
 
 static void write_complete(struct ring_io *rio)
 {
-    rio->wd_cons += (rio->io_cnt-1) * 512;
-    /* A partial sector flush followed by more writing could re-dirty the last
-     * sector. A partial sector may not even be complete yet. */
-    if (!BIT_GET(rio->dirty_bitfield, ring_io_idx(rio, rio->wd_cons)/512)
-            && rio->wd_cons + 512 <= rio->wd_prod)
-        rio->wd_cons += 512;
-    ASSERT(rio->wd_cons <= rio->wd_prod);
     enqueue_io(rio);
 }
 
@@ -81,23 +84,38 @@ static void write_start(struct ring_io *rio)
 {
     struct image_buf *rd = rio->read_data;
     FOP fop;
-    uint32_t max_io_cnt, start_bit;
+    uint32_t max_io_cnt, start_bit, cons;
+    bool_t has_shadow = rio->f_shadow_off != ~0;
     ASSERT(rio->sync_needed);
     ASSERT(BIT_ANY(rio->dirty_bitfield));
-    /* Skip unmodified. */
-    while (rio->wd_cons + 511 < rio->wd_prod
-            && !BIT_GET(rio->dirty_bitfield, ring_io_idx(rio, rio->wd_cons)/512))
-        rio->wd_cons += 512;
+    /* Since seeks can rewind the reader, check for writes past the producer. */
+    cons = rio->wd_cons;
+    while (cons + 511 < rd->prod) {
+        uint32_t i = (cons % rio->ring_len) / 512;
+        if (BIT_GET(rio->dirty_bitfield, i))
+            break;
+        if (has_shadow && BIT_GET(rio->dirty_bitfield, i + rio->ring_len/512))
+            break;
+        cons += 512;
+    }
+    if (0) printk("dirty: %08x %08x %08x %08x\n",
+            rio->dirty_bitfield[3],
+            rio->dirty_bitfield[2],
+            rio->dirty_bitfield[1],
+            rio->dirty_bitfield[0]);
 
     /* Find contiguous write. */
     /* Do not take into account wd_prod, because there may be a partial sector
      * to flush. */
     max_io_cnt = min_t(uint32_t,
-            (rio->ring_len - ring_io_idx(rio, rio->wd_cons)) / 512,
-            (rio->f_len - ring_io_pos(rio, rio->wd_cons)) / 512);
+            (rio->ring_len - cons % rio->ring_len) / 512,
+            (rio->f_len - ring_io_pos(rio, cons)) / 512);
     max_io_cnt = min_t(uint8_t, rio->batch_secs, max_io_cnt);
     ASSERT(max_io_cnt);
-    start_bit = ring_io_idx(rio, rio->wd_cons) / 512;
+
+    /* Check primary ring. */
+
+    start_bit = (cons % rio->ring_len) / 512;
     for (rio->io_cnt = 0; rio->io_cnt < max_io_cnt; rio->io_cnt++) {
         if (!BIT_GET(rio->dirty_bitfield, start_bit + rio->io_cnt))
             break;
@@ -105,19 +123,36 @@ static void write_start(struct ring_io *rio)
         BIT_CLR(rio->dirty_bitfield, start_bit + rio->io_cnt);
     }
 
-    F_lseek_async(rio->fp, rio->f_off + ring_io_pos(rio, rio->wd_cons));
+    if (rio->io_cnt) {
+        F_lseek_async(rio->fp, rio->f_off + ring_io_pos(rio, cons));
+        fop = F_write_async(rio->fp, rd->p + cons % rio->ring_len,
+                rio->io_cnt * 512, NULL);
+        register_fop_whendone(rio, fop, write_complete);
+        return;
+    }
+    ASSERT(has_shadow);
 
-    fop = F_write_async(rio->fp, rd->p + ring_io_idx(rio, rio->wd_cons),
+    /* There must be a shadow ring write necessary. */
+
+    start_bit += rio->ring_len/512;
+    for (rio->io_cnt = 0; rio->io_cnt < max_io_cnt; rio->io_cnt++) {
+        if (!BIT_GET(rio->dirty_bitfield, start_bit + rio->io_cnt))
+            break;
+        /* Clear eagerly to re-write a partial flush if necessary. */
+        BIT_CLR(rio->dirty_bitfield, start_bit + rio->io_cnt);
+    }
+    ASSERT(rio->io_cnt);
+    F_lseek_async(rio->fp, rio->f_shadow_off + ring_io_pos(rio, cons));
+    fop = F_write_async(rio->fp,
+            rd->p + rio->ring_len + cons % rio->ring_len,
             rio->io_cnt * 512, NULL);
     register_fop_whendone(rio, fop, write_complete);
 }
 
 static void read_complete(struct ring_io *rio)
 {
-    struct image_buf *rd = rio->read_data;
-    rd->prod += rio->io_cnt * 512;
-    if (rio->ring_len == rio->f_len)
-        rio->read_bytes += rio->io_cnt * 512;
+    for (int i = 0; i < rio->io_cnt; i++)
+        BIT_CLR(rio->unread_bitfield, rio->io_idx + i);
     enqueue_io(rio);
 }
 
@@ -125,26 +160,47 @@ static void read_start(struct ring_io *rio)
 {
     struct image_buf *rd = rio->read_data;
     FOP fop;
-    uint32_t max_cnt = min_t(uint32_t,
-            rio->ring_len - ring_io_idx(rio, rd->prod),
-            rio->f_len - ring_io_pos(rio, rd->prod));
-    if (rio->ring_len == rio->f_len)
-        max_cnt = min_t(uint32_t, max_cnt, rio->f_len - rio->read_bytes);
-    else {
-        uint32_t cons = rio->sync_needed ? rio->wd_cons : rd->cons;
-        /* Checking the ring length should not actually matter, because
-         * enqueue_io() wouldn't call read_start() unless there was a full
-         * batch to read. But that check is an optimization whereas this is for
-         * correctness. */
-        max_cnt = min_t(uint32_t, max_cnt, rio->ring_len + cons - rd->prod);
+    uint32_t max_io_cnt;
+    if (0) printk("unread: %08x %08x %08x %08x\n",
+            rio->unread_bitfield[3],
+            rio->unread_bitfield[2],
+            rio->unread_bitfield[1],
+            rio->unread_bitfield[0]);
+
+    /* Find contiguous read. */
+    max_io_cnt = min_t(uint32_t,
+            rio->ring_len - rd->prod % rio->ring_len,
+            rio->f_len - ring_io_pos(rio, rd->prod)) / 512;
+    max_io_cnt = min_t(uint8_t, max_io_cnt,
+            (rio->rd_valid + rio->ring_len - rd->prod) / 512);
+    max_io_cnt = min_t(uint8_t, rio->batch_secs, max_io_cnt);
+    ASSERT(max_io_cnt);
+
+    /* Check primary ring. */
+    rio->io_idx = (rd->prod % rio->ring_len) / 512;
+    for (rio->io_cnt = 0; rio->io_cnt < max_io_cnt; rio->io_cnt++) {
+        if (!BIT_GET(rio->unread_bitfield, rio->io_idx + rio->io_cnt))
+            break;
     }
-    rio->io_cnt = min_t(uint8_t, rio->batch_secs, max_cnt / 512);
-    if (rd->prod + rio->io_cnt * 512 - rio->rd_valid > rio->ring_len)
-        rio->rd_valid = rd->prod + rio->io_cnt * 512 - rio->ring_len;
+    if (rio->io_cnt) {
+        F_lseek_async(rio->fp, rio->f_off + ring_io_pos(rio, rd->prod));
+        fop = F_read_async(rio->fp, rd->p + rd->prod % rio->ring_len,
+                rio->io_cnt * 512, NULL);
+        register_fop_whendone(rio, fop, read_complete);
+        return;
+    }
+    ASSERT(rio->f_shadow_off != ~0);
 
-    F_lseek_async(rio->fp, rio->f_off + ring_io_pos(rio, rd->prod));
-
-    fop = F_read_async(rio->fp, rd->p + ring_io_idx(rio, rd->prod),
+    /* There must be a shadow ring read necessary. */
+    rio->io_idx += rio->ring_len/512;
+    for (rio->io_cnt = 0; rio->io_cnt < max_io_cnt; rio->io_cnt++) {
+        if (!BIT_GET(rio->unread_bitfield, rio->io_idx + rio->io_cnt))
+            break;
+    }
+    ASSERT(rio->io_cnt);
+    F_lseek_async(rio->fp, rio->f_shadow_off + ring_io_pos(rio, rd->prod));
+    fop = F_read_async(rio->fp,
+            rd->p + rio->ring_len + rd->prod % rio->ring_len,
             rio->io_cnt * 512, NULL);
     register_fop_whendone(rio, fop, read_complete);
 }
@@ -152,30 +208,68 @@ static void read_start(struct ring_io *rio)
 static void enqueue_io(struct ring_io *rio)
 {
     struct image_buf *rd = rio->read_data;
-    uint32_t cons = rd->cons & ~511;
-    cons -= min_t(uint32_t, rio->trailing_len, cons);
-    if (rio->sync_needed)
-        cons = min_t(uint32_t, rio->wd_cons, cons);
+    uint32_t cons;
+    bool_t has_shadow = rio->f_shadow_off != ~0;
+
     if (rio->fop_cb != NULL)
         return;
 
-    if (rio->disable_reading)
-        ; /* Skip reading checks. */
-    else if (rio->ring_len == rio->f_len) {
-        if (rio->read_bytes != rio->f_len) {
-            read_start(rio);
-            return;
+    if (rio->sync_needed) {
+        /* Advance write cursor past unmodified blocks. */
+        while (rio->wd_cons + 511 < rio->wd_prod) {
+            uint32_t i = (rio->wd_cons % rio->ring_len) / 512;
+            if (BIT_GET(rio->dirty_bitfield, i))
+                break;
+            if (has_shadow
+                    && BIT_GET(rio->dirty_bitfield, i + rio->ring_len/512))
+                break;
+            rio->wd_cons += 512;
         }
-        rd->prod = cons + rio->ring_len;
-    } else {
-        if (rd->prod < cons)
-            rd->prod = cons;
 
-        /* Only read if we can do a full batch, to optimize I/O throughput. */
-        if (rd->prod + rio->batch_secs * 512 - cons <= rio->ring_len) {
-            read_start(rio);
-            return;
+        cons = rd->cons & ~511;
+        cons = min_t(uint32_t, rio->wd_cons, cons);
+    } else {
+        cons = rd->cons & ~511;
+        ASSERT(cons >= rio->rd_valid);
+        cons -= min_t(uint32_t, rio->trailing_secs*512, cons);
+        cons = max_t(uint32_t, cons, rio->rd_valid);
+    }
+
+    if (rd->prod + rio->batch_secs * 512 < cons)
+        /* Jump forward. */
+        rd->prod = cons;
+
+    if (rio->ring_len == rio->f_len)
+        /* Fully buffered, so no need to BIT_SET unread_bitfield. */
+        rio->rd_valid = cons;
+    else {
+        /* Invalidate read data to open up space for new reads. Do it in
+         * batches to optimize I/O throughput. */
+        if (rio->rd_valid + rio->batch_secs * 512 <= cons
+                && rio->rd_valid + rio->ring_len <= rd->prod) {
+            for (int i = 0; i < rio->batch_secs; i++) {
+                uint32_t p = (rio->rd_valid % rio->ring_len) / 512;
+                BIT_SET(rio->unread_bitfield, p);
+                if (has_shadow)
+                    BIT_SET(rio->unread_bitfield, p + rio->ring_len/512);
+                rio->rd_valid += 512;
+            }
         }
+    }
+
+    /* Advance read cursor past already read blocks. */
+    while (rio->rd_valid + rio->ring_len > rd->prod) {
+        uint32_t i = (rd->prod % rio->ring_len) / 512;
+        if (BIT_GET(rio->unread_bitfield, i))
+            break;
+        if (has_shadow && BIT_GET(rio->unread_bitfield, i + rio->ring_len/512))
+            break;
+        rd->prod += 512;
+    }
+
+    if (!rio->disable_reading && rio->rd_valid + rio->ring_len > rd->prod) {
+        read_start(rio);
+        return;
     }
 
     if (rio->sync_needed) {
@@ -190,23 +284,37 @@ static void enqueue_io(struct ring_io *rio)
 void ring_io_sync(struct ring_io *rio)
 {
     struct image_buf *rd = rio->read_data;
+    uint8_t batch_secs = rio->batch_secs;
     ASSERT(!rio->writing || rio->wd_prod == rd->cons); /* Missing a flush? */
     /* Write out as quickly as possible. Avoid lingering reads, as the caller
      * will likely call ring_io_init() just after this.  */
     rio->disable_reading = TRUE;
+    rio->batch_secs = 255;
     while (rio->sync_needed) {
         ASSERT(rio->fop_cb != NULL);
         progress_io(rio);
     }
+    rio->batch_secs = batch_secs;
     rio->disable_reading = FALSE;
 }
 
-void ring_io_seek(struct ring_io *rio, uint32_t pos, bool_t writing)
+void ring_io_shutdown(struct ring_io *rio)
+{
+    if (rio->fop_cb == NULL)
+        return;
+    F_async_wait(rio->fop);
+}
+
+void ring_io_seek(
+        struct ring_io *rio, uint32_t pos, bool_t writing, bool_t shadow)
 {
     struct image_buf *rd = rio->read_data;
+    bool_t has_shadow = rio->f_shadow_off != ~0;
     ASSERT(!rio->writing || rio->wd_prod == rd->cons); /* Missing a flush? */
+    ASSERT(!shadow || rio->f_shadow_off != ~0);
 
     rio->writing = writing;
+    rio->shadow_active = shadow;
     if (rio->ring_off == RING_INIT) {
         rd->prod = rio->rd_valid = 0;
         rd->cons = pos % 512;
@@ -216,11 +324,23 @@ void ring_io_seek(struct ring_io *rio, uint32_t pos, bool_t writing)
         if (valid_pos > pos)
             pos += rio->f_len;
         rd->cons = rio->rd_valid + pos - valid_pos;
+        rd->prod = rd->cons & ~511;
+    }
+    /* Advance read cursor past already read blocks. */
+    while (rio->rd_valid + rio->ring_len > rd->prod) {
+        uint32_t i = (rd->prod % rio->ring_len) / 512;
+        if (BIT_GET(rio->unread_bitfield, i))
+            break;
+        if (has_shadow && BIT_GET(rio->unread_bitfield, i + rio->ring_len/512))
+            break;
+        rd->prod += 512;
     }
     if (writing) {
         rio->wd_prod = rd->cons;
         if (!rio->sync_needed)
             rio->wd_cons = rio->wd_prod & ~511;
+        else
+            rio->wd_cons = min_t(uint32_t, rio->wd_cons, rio->wd_prod & ~511);
     }
 
     enqueue_io(rio);
